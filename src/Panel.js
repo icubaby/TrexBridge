@@ -1041,9 +1041,9 @@ const Router = {
 					});
 				}
 				const startIdx = state.proxyCursor.at % n;
-				const maxTry = Math.min(24, n);
+				const maxTry = Math.min(48, n);
 				const waveSize = 8;
-				const pingMs = 450;
+				const pingMs = 1200;
 				let winner = null;
 				for (let k = 0; k < maxTry && !winner; k += waveSize) {
 					const wave = [];
