@@ -1,249 +1,299 @@
 import { connect } from "cloudflare:sockets";
 
-const tbTrafficMap = new Map();
-const tbConnCount = new Map();
-const tbLastActive = new Map();
-const tbLastWrite = new Map();
-const tbWriteLock = new Map();
-const tbDnsCache = new Map();
-const tbReqCache = new Map();
-const tbLoginAttempts = new Map();
-let tbReqTotal = 0;
-let tbLastReqWrite = 0;
-let CF_REQ_CACHE = { day: "", base: 0, fetchedAt: 0, delta: 0 };
-const TB_DNS_TTL = 5 * 60 * 1000;
-const DOH_RESOLVER = atob(String.fromCharCode(97,72,82,48,99,72,77,54,76,121,57,106,98,71,57,49,90,71,90,115,89,88,74,108,76,87,82,117,99,121,53,106,98,50,48,118,90,71,53,122,76,88,70,49,90,88,74,53));
-const UPSTREAM_BUNDLE_TARGET_BYTES = 128 * 1024;
-const UPSTREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
-const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
-const DOWNSTREAM_GRAIN_BYTES = 32 * 1024;
-const TB_DNS_MAX = 2048;
-const TEXT_ENCODER = new TextEncoder();
-const TEXT_DECODER = new TextDecoder();
-const TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
-let _tbProxyCursor = { list: [], at: 0, fetchedAt: 0 };
+const state = {
+  traffic: new Map(),
+  connections: new Map(),
+  lastActive: new Map(),
+  lastWrite: new Map(),
+  writeLock: new Map(),
+  dnsCache: new Map(),
+  reqCache: new Map(),
+  loginAttempts: new Map(),
+  reqTotal: 0,
+  lastReqWrite: 0,
+  cfReq: { day: "", base: 0, fetchedAt: 0, delta: 0 },
+  proxyCursor: { list: [], at: 0, fetchedAt: 0 },
+};
 
-const TREX_FRAG_QUERY = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") + "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
-const DEFAULT_FRAG_QUERY = "&fragment=" + encodeURIComponent("tlshello,100-200,1-1,100-200");
-const TREX_FRAG_JSON = JSON.stringify({
-	mode: "flux",
-	packets: "tlshello",
-	length: "5,94,1",
-	interval: "0",
-	maxSplit: "0",
-	dual: true,
-	packets2: "1-1",
-	length2: "109,1",
-	interval2: "1",
-	maxSplit2: "355",
-	protocols: "vless",
+const DNS_TTL_MS = 5 * 60 * 1000;
+const DNS_MAX = 2048;
+const DOH_URL = "https://cloudflare-dns.com/dns-query";
+const UPSTREAM_BUNDLE = 128 * 1024;
+const UPSTREAM_QUEUE_BYTES = 16 * 1024 * 1024;
+const UPSTREAM_QUEUE_ITEMS = 4096;
+const DOWNSTREAM_GRAIN = 32 * 1024;
+const UTF8 = new TextEncoder();
+const FROM_UTF8 = new TextDecoder();
+const TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
+
+const FLUX_QUERY =
+  "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") +
+  "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
+const DEFAULT_FRAG_QUERY =
+  "&fragment=" + encodeURIComponent("tlshello,100-200,1-1,100-200");
+const FLUX_JSON = JSON.stringify({
+  mode: "flux",
+  packets: "tlshello",
+  length: "5,94,1",
+  interval: "0",
+  maxSplit: "0",
+  dual: true,
+  packets2: "1-1",
+  length2: "109,1",
+  interval2: "1",
+  maxSplit2: "355",
+  protocols: "vless",
 });
 const DEFAULT_FRAG_JSON = JSON.stringify({
-	mode: "default",
-	packets: "tlshello",
-	length: "100-200",
-	interval: "1-1",
-	maxSplit: "100-200",
-	protocols: "vless",
+  mode: "default",
+  packets: "tlshello",
+  length: "100-200",
+  interval: "1-1",
+  maxSplit: "100-200",
+  protocols: "vless",
 });
-function isTrexFrag(userOrFrag) {
-	try {
-		let raw = userOrFrag;
-		if (raw && typeof raw === "object" && raw.frag_len !== undefined) raw = raw.frag_len;
-		if (raw == null || raw === "") return false;
-		const s = String(raw);
-		if (s.includes("trex") || s.includes("flux") || s.includes("packets2") || s.includes("5,94,1") || s.includes('"dual":true') || s.includes('"dual": true')) return true;
-		if (!s.trim().startsWith("{")) return false;
-		const f = JSON.parse(s);
-		if (!f || typeof f !== "object") return false;
-		const mode = String(f.mode || "").toLowerCase();
-		return mode === "trex" || mode === "flux" || f.dual === true || !!f.packets2;
-	} catch (e) {
-		return false;
-	}
+
+const CLEAN_IP_URL =
+  "https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main/data/CleanIP.json";
+const REPO_BASE =
+  "https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main";
+const PROXY_LIST_URL =
+  "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=3000";
+
+function isFluxFrag(userOrFrag) {
+  try {
+    let raw = userOrFrag;
+    if (raw && typeof raw === "object" && raw.frag_len !== undefined) raw = raw.frag_len;
+    if (raw == null || raw === "") return false;
+    const s = String(raw);
+    if (
+      s.includes("trex") ||
+      s.includes("flux") ||
+      s.includes("packets2") ||
+      s.includes("5,94,1") ||
+      s.includes('"dual":true') ||
+      s.includes('"dual": true')
+    )
+      return true;
+    if (!s.trim().startsWith("{")) return false;
+    const f = JSON.parse(s);
+    if (!f || typeof f !== "object") return false;
+    const mode = String(f.mode || "").toLowerCase();
+    return mode === "trex" || mode === "flux" || f.dual === true || !!f.packets2;
+  } catch (e) {
+    return false;
+  }
 }
 
-function toBoldSans(str) {
-	let out = "";
-	for (const ch of String(str || "")) {
-		const c = ch.codePointAt(0);
-		if (c >= 65 && c <= 90) out += String.fromCodePoint(0x1D5D4 + (c - 65));
-		else if (c >= 97 && c <= 122) out += String.fromCodePoint(0x1D5EE + (c - 97));
-		else if (c >= 48 && c <= 57) out += String.fromCodePoint(0x1D7EC + (c - 48));
-		else out += ch;
-	}
-	return out;
-}
-function flagFromCC(cc) {
-	try {
-		const code = String(cc || "").trim().toUpperCase();
-		if (code.length !== 2 || code === "XX" || code === "ZZ") return "";
-		return String.fromCodePoint(...code.split("").map((ch) => 127397 + ch.charCodeAt(0)));
-	} catch (e) {
-		return "";
-	}
-}
-function buildConfigRemark(user, protocol, countryCode) {
-	const uname = String((user && user.username) || "user");
-	const m = uname.match(/^TrexBridge[-_]?(.+)$/i);
-	let namePart;
-	if (m) {
-		const rnd = String(m[1] || "").replace(/[^a-zA-Z0-9]/g, "");
-		namePart = (rnd.slice(0, 3) || "x").toLowerCase();
-	} else {
-		namePart = uname;
-	}
-	return "🦖 - " + toBoldSans("TrexBridge") + "-" + toBoldSans(namePart);
+function boldSans(str) {
+  let out = "";
+  for (const ch of String(str || "")) {
+    const c = ch.codePointAt(0);
+    if (c >= 65 && c <= 90) out += String.fromCodePoint(0x1d5d4 + (c - 65));
+    else if (c >= 97 && c <= 122) out += String.fromCodePoint(0x1d5ee + (c - 97));
+    else if (c >= 48 && c <= 57) out += String.fromCodePoint(0x1d7ec + (c - 48));
+    else out += ch;
+  }
+  return out;
 }
 
-function parseUserIps(user, host) {
-	const out = [];
-	const seen = new Set();
-	const push = (v) => {
-		const x = String(v || "").trim();
-		if (!x) return;
-		const key = x.toLowerCase();
-		if (seen.has(key)) return;
-		seen.add(key);
-		out.push(x);
-	};
-	if (user && user.ips) {
-		String(user.ips)
-			.split(/[\n,\r]+/)
-			.map((s) => s.trim())
-			.filter(Boolean)
-			.forEach((ip) => {
-				const v = String(ip).trim();
-				if (!v) return;
-				if (host && v.toLowerCase() === String(host).toLowerCase()) return;
-				if (/\.workers\.dev$/i.test(v)) return;
-				push(v);
-			});
-	}
-	// Always include worker hostname so clients can connect even if Clean IPs are dead
-	if (host) push(host);
-	if (!out.length && host) push(host);
-	return out;
-}
-function parseUserPorts(user) {
-	const ports = String((user && user.port) || "443")
-		.split(",")
-		.map((p) => p.trim())
-		.filter(Boolean);
-	return ports.length ? ports : ["443"];
-}
-function buildFragmentQueryFromUser(user) {
-	let protos = ["vless"];
-	let useFlux = true;
-	try {
-		let raw = user && user.frag_len != null ? user.frag_len : "";
-		if (raw && typeof raw === "object") {
-			try { raw = JSON.stringify(raw); } catch (eO) { raw = ""; }
-		}
-		const s = String(raw || "").trim();
-		if (s) {
-			// explicit default mode only
-			let isDefault = false;
-			if (s.charAt(0) === "{") {
-				try {
-					const f = JSON.parse(s);
-					if (f && typeof f === "object") {
-						const mode = String(f.mode || "").toLowerCase();
-						if (mode === "default" || mode === "normal") isDefault = true;
-						if (f.protocols) {
-							protos = String(f.protocols).split(",").map(function (p) { return p.trim().toLowerCase(); }).filter(Boolean);
-							if (!protos.length) protos = ["vless"];
-						}
-					}
-				} catch (e2) {}
-			} else if (s.indexOf("default") >= 0 && s.indexOf("flux") < 0 && s.indexOf("trex") < 0 && s.indexOf("packets2") < 0) {
-				isDefault = true;
-			}
-			useFlux = !isDefault;
-		}
-	} catch (e) {}
-	return { query: useFlux ? TREX_FRAG_QUERY : DEFAULT_FRAG_QUERY, protos: protos, flux: useFlux };
-}
-function buildAllConfigLinks(user, host) {
-	const ips = parseUserIps(user, host);
-	const ports = parseUserPorts(user);
-	const fp = (user && user.fingerprint) || "chrome";
-	const path = encodeURIComponent("/api/ws");
-	const frag = buildFragmentQueryFromUser(user);
-	// ALWAYS attach fragment — never omit (flux default)
-	const userFrag = (frag && frag.flux === false) ? DEFAULT_FRAG_QUERY : TREX_FRAG_QUERY;
-	const protos = frag.protos && frag.protos.length ? frag.protos : ["vless"];
-	const uuid = (user && user.uuid) || "";
-	const links = [];
-	for (const ip of ips) {
-		for (const port of ports) {
-			const isTls = TLS_PORTS.has(String(port));
-			const tlsVal = isTls ? "tls" : "none";
-			if (protos.includes("vless")) {
-				const remark = buildConfigRemark(user, "vless", "");
-				// Original Trex order: path, security, encryption, insecure, host, fp, type, allowInsecure, sni, fragment...
-				links.push(
-					"vless://" + uuid + "@" + ip + ":" + port +
-					"?path=" + path +
-					"&security=" + tlsVal +
-					"&encryption=none&insecure=0&host=" + host +
-					"&fp=" + fp +
-					"&type=ws&allowInsecure=0&sni=" + host +
-					"&ed=2560" +
-					userFrag +
-					"#" + encodeURIComponent(remark)
-				);
-			}
-			if (protos.includes("trojan")) {
-				const alpn = tlsVal === "tls" ? "&alpn=http%2F1.1" : "";
-				const remark = buildConfigRemark(user, "trojan", "");
-				links.push(
-					"trojan://" + uuid + "@" + ip + ":" + port +
-					"?path=" + path +
-					"&security=" + tlsVal +
-					"&type=ws&host=" + host +
-					"&fp=" + fp +
-					"&sni=" + host +
-					"&allowInsecure=0" + alpn +
-					"&ed=2560" +
-					userFrag +
-					"#" + encodeURIComponent(remark)
-				);
-			}
-		}
-	}
-	return links;
+function configRemark(user) {
+  const uname = String((user && user.username) || "user");
+  const m = uname.match(/^TrexBridge[-_]?(.*)$/i);
+  let namePart;
+  if (m) {
+    const rnd = String(m[1] || "").replace(/[^a-zA-Z0-9]/g, "");
+    namePart = (rnd.slice(0, 3) || "x").toLowerCase();
+  } else {
+    namePart = uname;
+  }
+  return "🦖 - " + boldSans("TrexBridge") + "-" + boldSans(namePart);
 }
 
-function safeDecodeURI(value) {
-	try {
-		return decodeURIComponent(value);
-	} catch (e) {
-		return value;
-	}
+function userIps(user, host) {
+  const out = [];
+  const seen = new Set();
+  const push = (v) => {
+    const x = String(v || "").trim();
+    if (!x) return;
+    const key = x.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(x);
+  };
+  if (user && user.ips) {
+    String(user.ips)
+      .split(/[\n,\r]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .forEach((ip) => {
+        const v = String(ip).trim();
+        if (!v) return;
+        if (host && v.toLowerCase() === String(host).toLowerCase()) return;
+        if (/\.workers\.dev$/i.test(v)) return;
+        push(v);
+      });
+  }
+  if (host) push(host);
+  if (!out.length && host) push(host);
+  return out;
 }
-async function readJsonBody(request) {
-	try {
-		const body = await request.json();
-		return body && typeof body === "object" ? body : {};
-	} catch (e) {
-		return {};
-	}
+
+function userPorts(user) {
+  const ports = String((user && user.port) || "443")
+    .split(",")
+    .map((p) => p.trim())
+    .filter(Boolean);
+  return ports.length ? ports : ["443"];
 }
-const CLEAN_IP_JSON_URL = 'https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main/data/CleanIP.json';
-const PANEL_REPO_BASE = 'https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main';
-async function fetchWithFallback(path, options = {}) {
+
+function fragOptions(user) {
+  let protos = ["vless"];
+  let useFlux = true;
+  try {
+    let raw = user && user.frag_len != null ? user.frag_len : "";
+    if (raw && typeof raw === "object") {
+      try {
+        raw = JSON.stringify(raw);
+      } catch (eO) {
+        raw = "";
+      }
+    }
+    const s = String(raw || "").trim();
+    if (s) {
+      let isDefault = false;
+      if (s.charAt(0) === "{") {
+        try {
+          const f = JSON.parse(s);
+          if (f && typeof f === "object") {
+            const mode = String(f.mode || "").toLowerCase();
+            if (mode === "default" || mode === "normal") isDefault = true;
+            if (f.protocols) {
+              protos = String(f.protocols)
+                .split(",")
+                .map((p) => p.trim().toLowerCase())
+                .filter(Boolean);
+              if (!protos.length) protos = ["vless"];
+            }
+          }
+        } catch (e2) {}
+      } else if (
+        s.indexOf("default") >= 0 &&
+        s.indexOf("flux") < 0 &&
+        s.indexOf("trex") < 0 &&
+        s.indexOf("packets2") < 0
+      ) {
+        isDefault = true;
+      }
+      useFlux = !isDefault;
+    }
+  } catch (e) {}
+  return {
+    query: useFlux ? FLUX_QUERY : DEFAULT_FRAG_QUERY,
+    protos,
+    flux: useFlux,
+  };
+}
+
+function configLinks(user, host) {
+  const ips = userIps(user, host);
+  const ports = userPorts(user);
+  const fp = (user && user.fingerprint) || "chrome";
+  const path = encodeURIComponent("/api/ws");
+  const frag = fragOptions(user);
+  const userFrag = frag && frag.flux === false ? DEFAULT_FRAG_QUERY : FLUX_QUERY;
+  const protos = frag.protos && frag.protos.length ? frag.protos : ["vless"];
+  const uuid = (user && user.uuid) || "";
+  const links = [];
+  for (const ip of ips) {
+    for (const port of ports) {
+      const isTls = TLS_PORTS.has(String(port));
+      const tlsVal = isTls ? "tls" : "none";
+      if (protos.includes("vless")) {
+        const remark = configRemark(user);
+        links.push(
+          "vless://" +
+            uuid +
+            "@" +
+            ip +
+            ":" +
+            port +
+            "?path=" +
+            path +
+            "&security=" +
+            tlsVal +
+            "&encryption=none&insecure=0&host=" +
+            host +
+            "&fp=" +
+            fp +
+            "&type=ws&allowInsecure=0&sni=" +
+            host +
+            userFrag +
+            "#" +
+            encodeURIComponent(remark)
+        );
+      }
+      if (protos.includes("trojan")) {
+        const alpn = tlsVal === "tls" ? "&alpn=http%2F1.1" : "";
+        const remark = configRemark(user);
+        links.push(
+          "trojan://" +
+            uuid +
+            "@" +
+            ip +
+            ":" +
+            port +
+            "?path=" +
+            path +
+            "&security=" +
+            tlsVal +
+            "&type=ws&host=" +
+            host +
+            "&fp=" +
+            fp +
+            "&sni=" +
+            host +
+            "&allowInsecure=0" +
+            alpn +
+            userFrag +
+            "#" +
+            encodeURIComponent(remark)
+        );
+      }
+    }
+  }
+  return links;
+}
+
+function decodeSafe(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch (e) {
+    return value;
+  }
+}
+
+async function readJson(request) {
+  try {
+    const body = await request.json();
+    return body && typeof body === "object" ? body : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+async function fetchRepo(path, options = {}) {
 	const p = (path || "").replace(/^\/+/, "");
 	if (p === "CleanIP.json" || p === "data/CleanIP.json") {
-		return await fetch(CLEAN_IP_JSON_URL + (options && options.cache === "no-store" ? "" : "?t=" + Date.now()), options);
+		const q = options && options.cache === "no-store" ? "" : "?t=" + Date.now();
+		return await fetch(CLEAN_IP_URL + q, options);
 	}
-	const customUrl = PANEL_REPO_BASE + "/" + p;
-	return await fetch(customUrl, options);
+	return await fetch(REPO_BASE + "/" + p, options);
 }
 
-async function fetchCleanIpData() {
+async function loadCleanIps() {
 	try {
-		const res = await fetchWithFallback("data/CleanIP.json", { cache: "no-store" });
+		const res = await fetchRepo("data/CleanIP.json", { cache: "no-store" });
 		if (!res || !res.ok) return {};
 		const data = await res.json();
 		return data && typeof data === "object" ? data : {};
@@ -252,7 +302,7 @@ async function fetchCleanIpData() {
 	}
 }
 
-function findOpList(data, key) {
+function opList(data, key) {
 	if (!data || typeof data !== "object" || !key) return [];
 	if (Array.isArray(data[key])) return data[key];
 	const want = String(key).toUpperCase();
@@ -275,7 +325,7 @@ function pickCleanIps(data, operator, count) {
 	const opUp = op.toUpperCase();
 	if (opUp === "ALL" || op === "") {
 		for (const k of opOrder) {
-			const list = (findOpList(data, k) || []).map(norm).filter(Boolean);
+			const list = (opList(data, k) || []).map(norm).filter(Boolean);
 			const uniq = Array.from(new Set(list));
 			if (uniq.length) uniquePush(pool, uniq[Math.floor(Math.random() * uniq.length)]);
 		}
@@ -285,7 +335,7 @@ function pickCleanIps(data, operator, count) {
 			for (const ip of list) uniquePush(pool, ip);
 		}
 	} else {
-		const list = (findOpList(data, op) || []).map(norm).filter(Boolean);
+		const list = (opList(data, op) || []).map(norm).filter(Boolean);
 		pool = Array.from(new Set(list));
 	}
 	for (let i = pool.length - 1; i > 0; i--) {
@@ -343,7 +393,7 @@ async function checkAutoRotates(env, ctx) {
 		if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=60" } })));
 		const { results: usersToRotate } = await env.DB.prepare("SELECT * FROM users WHERE auto_rotate_ip = 1 AND ? >= (last_rotate_time + (rotate_time * 60000))").bind(now).all();
 		if (!usersToRotate || usersToRotate.length === 0) return;
-				const res = await fetchWithFallback("data/CleanIP.json");
+				const res = await fetchRepo("data/CleanIP.json");
 		if (!res.ok) return;
 		let cachedIpsData = {};
 		try {
@@ -393,11 +443,11 @@ let cachedVipCountries = [];
 let lastVipCountriesFetch = 0;
 async function replaceBrokenProxy(username, env, oldProxy) {
 	try {
-		if (tbWriteLock.get(username + "_proxy_rotate")) return;
-		tbWriteLock.set(username + "_proxy_rotate", true);
+		if (state.writeLock.get(username + "_proxy_rotate")) return;
+		state.writeLock.set(username + "_proxy_rotate", true);
 		const user = await env.DB.prepare("SELECT id, user_socks5, auto_rotate_user_proxy FROM users WHERE username = ?").bind(username).first();
 		if (!user || user.auto_rotate_user_proxy !== 1 || !user.user_socks5) {
-			tbWriteLock.delete(username + "_proxy_rotate");
+			state.writeLock.delete(username + "_proxy_rotate");
 			return;
 		}
 		let proxyList = [];
@@ -421,7 +471,7 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 			}
 		}
 		if (matchIndex === -1) {
-			tbWriteLock.delete(username + "_proxy_rotate");
+			state.writeLock.delete(username + "_proxy_rotate");
 			return;
 		}
 		let countryCode = typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null && proxyList[matchIndex].country ? proxyList[matchIndex].country : "all";
@@ -469,7 +519,7 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		const isOldProxyVIP = oldProxy.includes("@");
 		if (cachedVipCountries.length === 0 || Date.now() - lastVipCountriesFetch > 3600000) {
 			try {
-				const ghRes = await fetchWithFallback("vip-list", {
+				const ghRes = await fetchRepo("vip-list", {
 					headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
 				});
 				if (ghRes.ok) {
@@ -500,7 +550,7 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		}
 		for (const src of sources) {
 			try {
-				const res = await fetchWithFallback(src.url);
+				const res = await fetchRepo(src.url);
 				if (!res.ok) continue;
 				const text = await res.text();
 				const lines = text
@@ -532,7 +582,7 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 										reject(new Error("timeout"));
 									}, 3000);
 									try {
-										const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+										const payload = UTF8.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
 										sock = await connectProxy(p, "1.1.1.1", 80, payload);
 										const reader = sock.readable.getReader();
 										const res = await reader.read();
@@ -575,23 +625,12 @@ async function replaceBrokenProxy(username, env, oldProxy) {
 		}
 	} catch (e) {
 	} finally {
-		tbWriteLock.delete(username + "_proxy_rotate");
+		state.writeLock.delete(username + "_proxy_rotate");
 	}
 }
 
-/* ===================== Telegram Bot ===================== */
-
-/* Telegram bot logic removed — panel only */
-async function tgSendDailyReport(env) {
-	return { ok: false, reason: "disabled" };
-}
-
-
-
-
-
-const PANEL_ENC_K = new Uint8Array([47, 145, 74, 211, 8, 126, 197, 22]);
-function panelUtf8ToBytes(str) {
+const SOURCE_XOR_KEY = new Uint8Array([47, 145, 74, 211, 8, 126, 197, 22]);
+function utf8Bytes(str) {
 	return new TextEncoder().encode(str);
 }
 function panelBytesToBase64(bytes) {
@@ -602,7 +641,7 @@ function panelBytesToBase64(bytes) {
 	}
 	return btoa(binary);
 }
-function panelEncodePayload(bytes, k) {
+function xorPayload(bytes, k) {
 	const out = new Uint8Array(bytes.length);
 	for (let i = 0; i < bytes.length; i++) {
 		let x = bytes[i] ^ k[i % k.length];
@@ -612,30 +651,28 @@ function panelEncodePayload(bytes, k) {
 	}
 	return panelBytesToBase64(out);
 }
-function preparePanelSourceForEncode(raw) {
+function stripSourceImports(raw) {
 	let s = String(raw || "").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
 	s = s.replace(/^\s*import\s*[\s\S]*?from\s*["']cloudflare:sockets["']\s*;?\s*/gm, "");
 	s = s.replace(/import\s*\{[^}]*\}\s*from\s*["']cloudflare:sockets["']\s*;?/g, "");
 	s = s.replace(/^[ \t]*import\b[^\n]*cloudflare:sockets[^\n]*$/gm, "");
 	return s;
 }
-function buildEncodedWorkerFromSource(cleanSource) {
-	const prepared = preparePanelSourceForEncode(cleanSource);
+function wrapWorkerSource(cleanSource) {
+	const prepared = stripSourceImports(cleanSource);
 	if (!prepared || prepared.length < 500) throw new Error("Panel source too short");
 	// Plain ES module deploy (no new Function encode) — reliable on Cloudflare
 	return 'import { connect } from "cloudflare:sockets";\n\n' + prepared.replace(/^\uFEFF/, "");
 }
 
-const __WORKER_EXPORT__ = {
+const WorkerApp = {
 	async scheduled(event, env, ctx) {
 		try {
 			if (!env.DB) return;
 			try {
 				await DbService.ensureSchema(env.DB);
 			} catch (e) {}
-			ctx.waitUntil(
-				tgSendDailyReport(env).catch(() => {})
-			);
+			/* no-op scheduled hook */
 		} catch (e) {}
 	},
 	async fetch(request, env, ctx) {
@@ -694,6 +731,7 @@ const __WORKER_EXPORT__ = {
 		}
 	},
 };
+/* ── HTTP router ── */
 const Router = {
 	isWebSocketUpgrade(request) {
 		const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
@@ -704,7 +742,7 @@ const Router = {
 	},
 	async handleWebSocket(request, env, ctx) {
 		try {
-			return await handlevIees(env, null, ctx, request);
+			return await handleVless(env, null, ctx, request);
 		} catch (e) {
 			try {
 				return new Response("Internal Server Error", { status: 500 });
@@ -715,7 +753,7 @@ const Router = {
 	},
 	async handleSubscription(url, env, request) {
 		const offset = 8; // "/export/".length
-		let subUser = safeDecodeURI(url.pathname.slice(offset));
+		let subUser = decodeSafe(url.pathname.slice(offset));
 		const host = url.hostname;
 		try {
 			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(subUser, subUser).first();
@@ -723,8 +761,8 @@ const Router = {
 				return new Response("Not Found", { status: 404 });
 			}
 			try {
-				const cur = tbReqCache.get(user.username) || 0;
-				tbReqCache.set(user.username, cur + 1);
+				const cur = state.reqCache.get(user.username) || 0;
+				state.reqCache.set(user.username, cur + 1);
 			} catch (e) {}
 			const raw = url.searchParams.get("raw") === "1" || url.searchParams.get("format") === "text";
 			const accept = ((request && request.headers.get("Accept")) || "").toLowerCase();
@@ -734,7 +772,7 @@ const Router = {
 			const wantsHtml = !raw && !isClient && (accept.includes("text/html") || ua.includes("mozilla") || ua.includes("chrome") || ua.includes("safari") || !ua);
 			if (wantsHtml) {
 				// Same UI as /profile status page — server builds links WITH fragment
-				const configLinks = buildAllConfigLinks(user, host) || [];
+				const configLinks = configLinks(user, host) || [];
 				const userJson = JSON.stringify({
 					config_links: configLinks,
 					username: user.username,
@@ -803,7 +841,7 @@ const Router = {
 		}
 	},
 	async handleUserStatus(url, env) {
-		const username = safeDecodeURI(url.pathname.slice(9));
+		const username = decodeSafe(url.pathname.slice(9));
 		if (!username) {
 			return new Response("Username is required", { status: 400 });
 		}
@@ -813,7 +851,7 @@ const Router = {
 				return new Response("User not found", { status: 404 });
 			}
 			const host = url.hostname;
-			const configLinks = buildAllConfigLinks(user, host) || [];
+			const configLinks = configLinks(user, host) || [];
 			const userJson = JSON.stringify({
 				config_links: configLinks,
 				username: user.username,
@@ -862,7 +900,7 @@ const Router = {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
 			}
-			const bodySetup = await readJsonBody(request);
+			const bodySetup = await readJson(request);
 			const cleanPassword = String(bodySetup.password || "").trim();
 			const cleanUser = String(bodySetup.username || "admin").trim() || "admin";
 			if (!cleanPassword || cleanPassword.length < 4) {
@@ -876,7 +914,7 @@ const Router = {
 			try {
 				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_username', ?)").bind(cleanUser).run();
 			} catch (e) {}
-			tbLoginAttempts.clear();
+			state.loginAttempts.clear();
 			return new Response(JSON.stringify({ success: true }), {
 				headers: {
 					"Content-Type": "application/json; charset=utf-8",
@@ -887,12 +925,12 @@ const Router = {
 		if (url.pathname === "/api/login" && request.method === "POST") {
 			const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
 			const now = Date.now();
-			if (tbLoginAttempts.size > 256) {
-				for (const [ip, rec] of tbLoginAttempts) {
-					if (now - rec.lastAttempt > 900000) tbLoginAttempts.delete(ip);
+			if (state.loginAttempts.size > 256) {
+				for (const [ip, rec] of state.loginAttempts) {
+					if (now - rec.lastAttempt > 900000) state.loginAttempts.delete(ip);
 				}
 			}
-			const attemptRecord = tbLoginAttempts.get(clientIP) || { count: 0, lastAttempt: 0 };
+			const attemptRecord = state.loginAttempts.get(clientIP) || { count: 0, lastAttempt: 0 };
 			if (attemptRecord.count >= 9 && now - attemptRecord.lastAttempt < 900000) {
 				const remaining = Math.ceil((900000 - (now - attemptRecord.lastAttempt)) / 60000);
 				return new Response(JSON.stringify({ error: `Access locked. Try again in ${remaining} minute(s).` }), {
@@ -900,7 +938,7 @@ const Router = {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
 			}
-			const body = await readJsonBody(request);
+			const body = await readJson(request);
 			const cleanUsername = String(body.username || "admin").trim() || "admin";
 			const cleanPassword = String(body.password || "").trim();
 			if (!cleanPassword) {
@@ -928,7 +966,7 @@ const Router = {
 				}
 			}
 			if (usernameOk && passwordOk) {
-				tbLoginAttempts.delete(clientIP);
+				state.loginAttempts.delete(clientIP);
 				return new Response(JSON.stringify({ success: true }), {
 					headers: {
 						"Content-Type": "application/json; charset=utf-8",
@@ -938,7 +976,7 @@ const Router = {
 			} else {
 				attemptRecord.count = now - attemptRecord.lastAttempt > 900000 ? 1 : attemptRecord.count + 1;
 				attemptRecord.lastAttempt = now;
-				tbLoginAttempts.set(clientIP, attemptRecord);
+				state.loginAttempts.set(clientIP, attemptRecord);
 				return new Response(JSON.stringify({ error: `Wrong username or password (${9 - attemptRecord.count} attempt(s) left)` }), {
 					status: 401,
 					headers: { "Content-Type": "application/json; charset=utf-8" },
@@ -955,10 +993,8 @@ const Router = {
 					});
 				}
 				const now = Date.now();
-				const RESET_MS = 10 * 60 * 1000; // every 10 minutes restart from top
 				const SRC = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=3000";
-
-				if (!_tbProxyCursor.list.length || now - (_tbProxyCursor.fetchedAt || 0) > RESET_MS) {
+				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 45000) {
 					const res = await fetch(SRC + "&_=" + now, {
 						headers: {
 							Accept: "text/plain,*/*",
@@ -975,34 +1011,33 @@ const Router = {
 					const lines = String(text || "").split(/\r?\n/).map(function (l) { return l.trim(); }).filter(Boolean);
 					const candidates = [];
 					const seen = new Set();
-					for (let i = 0; i < lines.length; i++) {
-						const line = lines[i];
+					for (let li = 0; li < lines.length; li++) {
+						let line = lines[li];
 						if (!line || line.charAt(0) === "#") continue;
-						let protocol = "socks5";
-						let hostport = line;
-						const m = line.match(/^(socks5|socks4|socks|http|https):\/\/(.+)$/i);
-						if (m) {
-							protocol = m[1].toLowerCase() === "socks" ? "socks5" : m[1].toLowerCase();
-							hostport = m[2];
+						let proxy = line;
+						// Keep protocol if present; otherwise try both later
+						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) {
+							proxy = "socks5://" + proxy;
 						}
-						if (protocol !== "socks5" && protocol !== "socks4") continue;
-						if (!hostport || hostport.indexOf(":") < 0) continue;
-						const proxy = protocol + "://" + hostport;
-						if (seen.has(proxy)) continue;
-						seen.add(proxy);
+						const key = proxy.toLowerCase();
+						if (seen.has(key)) continue;
+						seen.add(key);
 						candidates.push({ proxy: proxy, country: "" });
-						if (candidates.length >= 400) break;
 					}
+					candidates.sort(function (a, b) {
+						const as = /socks5/i.test(a.proxy) ? 0 : (/socks4/i.test(a.proxy) ? 1 : 2);
+						const bs = /socks5/i.test(b.proxy) ? 0 : (/socks4/i.test(b.proxy) ? 1 : 2);
+						return as - bs;
+					});
 					if (!candidates.length) {
-						return new Response(JSON.stringify({ error: "Empty proxy list" }), {
+						return new Response(JSON.stringify({ error: "No proxies from source" }), {
 							status: 404,
 							headers: { "Content-Type": "application/json; charset=utf-8" },
 						});
 					}
-					_tbProxyCursor = { list: candidates, at: 0, fetchedAt: now };
+					state.proxyCursor = { list: candidates, at: 0, fetchedAt: now };
 				}
-
-				const list = _tbProxyCursor.list;
+				const list = state.proxyCursor.list;
 				const n = list.length;
 				if (!n) {
 					return new Response(JSON.stringify({ error: "Empty proxy list" }), {
@@ -1010,77 +1045,66 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-
-				// ONE click = ONE proxy (cursor advances every time)
-				const idx = _tbProxyCursor.at % n;
-				const current = list[idx];
-				_tbProxyCursor.at = (idx + 1) % n;
-
-				let pHost = "";
-				let pPort = 1080;
-				try {
-					let remain = String(current.proxy || "").replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-					if (remain.startsWith("[")) {
-						const br = remain.indexOf("]");
-						pHost = remain.substring(1, br);
-						pPort = parseInt(remain.substring(br + 2), 10) || 1080;
-					} else {
-						const lc = remain.lastIndexOf(":");
-						if (lc > 0) {
-							pHost = remain.substring(0, lc);
-							pPort = parseInt(remain.substring(lc + 1), 10) || 1080;
-						} else {
-							pHost = remain;
+				// Sequential cursor: only return REAL verified live proxies
+				const startIdx = state.proxyCursor.at % n;
+				const maxTry = Math.min(25, n);
+				let winner = null;
+				for (let k = 0; k < maxTry && !winner; k += 5) {
+					const wave = [];
+					for (let j = 0; j < 5 && k + j < maxTry; j++) {
+						const idx = (startIdx + k + j) % n;
+						wave.push({ idx: idx, c: list[idx] });
+					}
+					const results = await Promise.all(
+						wave.map(async function (item) {
+							const tPing = Date.now();
+							try {
+								const ok = await isProxyLive(item.c.proxy, 900);
+								if (!ok) return null;
+								return { item: item, ms: Math.max(1, Date.now() - tPing) };
+							} catch (e) {
+								return null;
+							}
+						})
+					);
+					for (let ri = 0; ri < results.length; ri++) {
+						if (!results[ri]) continue;
+						const hit = results[ri];
+						const item = hit.item;
+						let country = item.c.country || "";
+						if (!country) {
+							try {
+								const host = String(item.c.proxy).replace(/^[a-z0-9]+:\/\//i, "").split(":")[0];
+								country = (await lookupExitCountry(host)) || "";
+								item.c.country = country;
+							} catch (eC) {}
 						}
-					}
-				} catch (eP) {}
-
-				const t0 = Date.now();
-				let live = false;
-				if (pHost) {
-					try {
-						live = await testProxyTcpOpen(pHost, pPort, 2200);
-					} catch (eT) {
-						live = false;
+						winner = {
+							proxy: item.c.proxy,
+							ms: hit.ms,
+							country: country,
+							index: item.idx,
+						};
+						state.proxyCursor.at = (item.idx + 1) % n;
+						break;
 					}
 				}
-				const ms = Math.max(1, Date.now() - t0);
-
-				let country = current.country || "";
-				if (!country && pHost) {
-					try {
-						country = (await lookupExitCountry(pHost)) || "";
-						current.country = country;
-					} catch (eC) {}
-				}
-
-				if (!live) {
-					return new Response(JSON.stringify({
-						ok: false,
-						error: "Proxy offline — click Random again for next",
-						proxy: current.proxy,
-						ms: ms,
-						country: country || "",
-						index: idx,
-						next: _tbProxyCursor.at,
-						live: false
-					}), {
-						status: 200,
+				if (!winner) {
+					state.proxyCursor.at = (startIdx + maxTry) % n;
+					return new Response(JSON.stringify({ error: "No live proxy found, try again" }), {
+						status: 404,
 						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
 					});
 				}
-
 				return new Response(JSON.stringify({
-					ok: true,
-					proxy: current.proxy,
-					ms: ms,
-					country: country || "",
+					proxy: winner.proxy,
+					ms: winner.ms,
+					country: winner.country || "",
 					source: "proxyscrape",
 					live: true,
 					verified: true,
-					index: idx,
-					next: _tbProxyCursor.at
+					index: winner.index,
+					next: state.proxyCursor.at
 				}), {
 					headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
 				});
@@ -1103,7 +1127,7 @@ const Router = {
 				}
 				const operator = (url.searchParams.get("operator") || "all").trim();
 				const count = Math.min(100, Math.max(1, parseInt(url.searchParams.get("count") || "20", 10) || 20));
-				const data = await fetchCleanIpData();
+				const data = await loadCleanIps();
 				const counts = {};
 				let totalAll = 0;
 				if (data && typeof data === "object") {
@@ -1136,7 +1160,7 @@ const Router = {
 			});
 		}
 		if (url.pathname === "/api/recover" && request.method === "POST") {
-			const bodyRecFull = await readJsonBody(request);
+			const bodyRecFull = await readJson(request);
 			const api_token = bodyRecFull.api_token;
 			if (!api_token) {
 				return new Response(JSON.stringify({ error: "Token is required" }), {
@@ -1208,7 +1232,7 @@ const Router = {
 					await env.DB.prepare("DELETE FROM settings WHERE key = 'panel_password'").run();
 					cachedPanelPassword = null;
 				}
-				tbLoginAttempts.clear();
+				state.loginAttempts.clear();
 				return new Response(JSON.stringify({ success: true, password_set: !!(newPass && newPass.length >= 4) }), {
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
@@ -1227,7 +1251,7 @@ const Router = {
 			});
 		}
 		if (url.pathname === "/api/auto-update-setup" && request.method === "POST") {
-			const body = await readJsonBody(request);
+			const body = await readJson(request);
 			if (body.action === "check") {
 				const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
 				const hasToken = !!env.CF_API_TOKEN || !!(dbTokenRow && dbTokenRow.value);
@@ -1261,13 +1285,13 @@ const Router = {
 		}
 		if (url.pathname === "/api/restart-core" && request.method === "POST") {
 			try {
-				tbTrafficMap.clear();
-				tbConnCount.clear();
-				tbLastActive.clear();
-				tbLastWrite.clear();
-				tbWriteLock.clear();
-				tbDnsCache.clear();
-				tbReqCache.clear();
+				state.traffic.clear();
+				state.connections.clear();
+				state.lastActive.clear();
+				state.lastWrite.clear();
+				state.writeLock.clear();
+				state.dnsCache.clear();
+				state.reqCache.clear();
 				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 			} catch (err) {
 				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
@@ -1303,7 +1327,7 @@ const Router = {
 												let newCode = await githubRes.text();
 				newCode = String(newCode || "").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
 				try {
-					newCode = buildEncodedWorkerFromSource(newCode);
+					newCode = wrapWorkerSource(newCode);
 				} catch (encErr) {
 					throw new Error("Update package failed to build. Try again.");
 				}
@@ -1358,7 +1382,7 @@ const Router = {
 			}
 		}
 		if (url.pathname === "/api/change-password" && request.method === "POST") {
-			const { current_password, new_password } = await readJsonBody(request);
+			const { current_password, new_password } = await readJson(request);
 			const cleanCurrent = (current_password || "").trim();
 			const cleanNew = (new_password || "").trim();
 			if (!cleanCurrent || !cleanNew) {
@@ -1407,7 +1431,7 @@ const Router = {
 				}
 			}
 			if (request.method === "POST") {
-				const body = await readJsonBody(request);
+				const body = await readJson(request);
 				if (body.settings && typeof body.settings === "object") {
 					for (const [k, v] of Object.entries(body.settings)) {
 						await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v)).run();
@@ -1417,10 +1441,10 @@ const Router = {
 			}
 		}
 		if (url.pathname === "/api/telegram/setup" && request.method === "POST") {
-			const body = await readJsonBody(request);
+			const body = await readJson(request);
 			const token = (body.token || "").trim();
 			const adminIds = (body.admin_ids || "").trim();
-			const channel = (body.channel || "@TrexBridge").trim();
+			const channel = (body.channel || "@TrexBridgePanel").trim();
 			if (!token || !adminIds) {
 				return new Response(JSON.stringify({ error: "token and admin_ids are required" }), { status: 400, headers: { "Content-Type": "application/json" } });
 			}
@@ -1453,7 +1477,7 @@ const Router = {
 		}
 		if (url.pathname === "/api/proxy-ip") {
 			if (request.method === "POST") {
-				const { proxy_ip, iata, socks5 } = await readJsonBody(request);
+				const { proxy_ip, iata, socks5 } = await readJson(request);
 				if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
 				if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
 				if (socks5 !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('socks5', ?)").bind(socks5).run();
@@ -1474,117 +1498,75 @@ const Router = {
 			}
 		}
 		if (url.pathname === "/api/test-proxy" && request.method === "POST") {
-			const body = await readJsonBody(request);
-			const proxy = body && body.proxy ? String(body.proxy).trim() : "";
-			if (!proxy) {
-				return new Response(JSON.stringify({ error: "Proxy is not set" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json" },
-				});
-			}
+			const { proxy } = await readJson(request);
+			if (!proxy) return new Response(JSON.stringify({ error: "Proxy is not set" }), { status: 400, headers: { "Content-Type": "application/json" } });
 			try {
 				let ip = "";
-				let port = 1080;
+				let workingProxy = proxy;
 				if (proxy.includes("t.me/socks") || proxy.includes("tg://socks")) {
-					ip = (proxy.match(/server=([^&]+)/) || [])[1] || "";
-					port = parseInt((proxy.match(/port=(\d+)/) || [])[1] || "1080", 10) || 1080;
+					ip = proxy.match(/server=([^&]+)/)?.[1] || "";
 				} else {
-					let remain = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+					let cleanProxy = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+					let remain = cleanProxy;
 					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
 					if (remain.startsWith("[")) {
-						const br = remain.indexOf("]");
-						ip = remain.substring(1, br);
-						port = parseInt(remain.substring(br + 2), 10) || 1080;
+						ip = remain.substring(1, remain.indexOf("]"));
 					} else {
-						const lc = remain.lastIndexOf(":");
-						if (lc > 0) {
-							ip = remain.substring(0, lc);
-							port = parseInt(remain.substring(lc + 1), 10) || 1080;
-						} else {
-							ip = remain;
-						}
+						const lastColon = remain.lastIndexOf(":");
+						if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
+						else ip = remain;
 					}
 				}
-				if (!ip) {
-					return new Response(JSON.stringify({ error: "Invalid proxy format" }), {
-						status: 400,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-
-				// Ping only (TCP)
-				const t0 = Date.now();
-				let live = false;
-				try {
-					live = await testProxyTcpOpen(ip, port, 3000);
-				} catch (ePing) {
-					live = false;
-				}
-				const ping = Math.max(1, Date.now() - t0);
-
-				if (!live) {
-					return new Response(JSON.stringify({
-						ok: false,
-						success: false,
-						error: "Proxy offline (no TCP response)",
-						ping: ping,
-						ms: ping,
-						country: "",
-						countryName: "",
-						loc: ""
-					}), {
-						status: 200,
-						headers: { "Content-Type": "application/json" },
-					});
-				}
-
-				// Location
-				let country = "";
-				let countryName = "";
-				try {
-					const geoRes = await fetch("http://ip-api.com/json/" + encodeURIComponent(ip) + "?fields=status,country,countryCode", {
-						headers: { Accept: "application/json" },
-					});
-					if (geoRes.ok) {
-						const geo = await geoRes.json();
-						if (geo && geo.status === "success") {
-							country = String(geo.countryCode || "").toUpperCase();
-							countryName = String(geo.country || "");
-						}
-					}
-				} catch (eGeo) {}
-				if (!country) {
+				let country = "UN";
+				const startTime = Date.now();
+				const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
+				const s = await connectProxy(proxy, "ip-api.com", 80, payload);
+				const reader = s.readable.getReader();
+				let resStr = "";
+				const dec = new TextDecoder();
+				const timeoutId = setTimeout(() => {
 					try {
-						country = (await lookupExitCountry(ip)) || "";
-					} catch (e2) {}
+						s.close();
+					} catch (e) {}
+				}, 3000);
+				try {
+					while (true) {
+						const res = await reader.read();
+						if (res.done || !res.value) break;
+						resStr += dec.decode(res.value, { stream: true });
+						if (resStr.includes("countryCode")) break;
+					}
+				} finally {
+					clearTimeout(timeoutId);
+					try {
+						s.close();
+					} catch (e) {}
 				}
-
-				const loc = countryName ? (country + " · " + countryName) : (country || "");
-				return new Response(JSON.stringify({
-					ok: true,
-					success: true,
-					ping: ping,
-					ms: ping,
-					country: country,
-					countryName: countryName,
-					loc: loc,
-					ip: ip,
-					port: port
-				}), {
-					headers: { "Content-Type": "application/json" },
-				});
+				if (!resStr) {
+					throw new Error("Timeout while receiving data");
+				}
+				const ping = Date.now() - startTime;
+				try {
+					const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
+					if (jsonMatch && jsonMatch[1]) country = jsonMatch[1];
+				} catch (e) {}
+				if (country === "UN" && ip) {
+					try {
+						const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
+						const geoData = await geoRes.json();
+						if (geoData && geoData.countryCode) country = geoData.countryCode;
+					} catch (e) {}
+				}
+				return new Response(JSON.stringify({ success: true, ok: true, ping, ms: ping, country, loc: country }), { headers: { "Content-Type": "application/json" } });
 			} catch (e) {
-				let msg = String(e && e.message || e || "error");
-				if (msg.includes("Stream was cancelled") || msg.includes("network")) msg = "Connection lost (proxy offline)";
-				else if (/timeout|timed out/i.test(msg)) msg = "Connection timeout";
-				else if (/Invalid URL|Invalid format/i.test(msg)) msg = "Invalid proxy format";
-				return new Response(JSON.stringify({ error: msg, ok: false }), {
-					status: 500,
-					headers: { "Content-Type": "application/json" },
-				});
+				let msg = e.message;
+				if (msg.includes("Stream was cancelled") || msg.includes("network")) msg = "Connection to server lost (proxy may be blocked or offline)";
+				else if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("timeout")) msg = "Connection timeout (proxy unavailable)";
+				else if (msg.includes("Invalid URL") || msg.includes("Invalid format")) msg = "Invalid proxy format";
+				else if (msg === "err") msg = "Unknown error (connection failed)";
+				return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
 			}
 		}
-
 		if (url.pathname === "/api/exit-countries" && request.method === "GET") {
 			try {
 				const countries = await buildExitCountries();
@@ -1626,22 +1608,22 @@ const Router = {
 		if (url.pathname.startsWith("/api/users")) {
 			const pathParts = url.pathname.split("/").filter(Boolean);
 			if (pathParts.length >= 4 && pathParts[pathParts.length - 1] === "configs" && request.method === "GET") {
-				const username = safeDecodeURI(pathParts[pathParts.length - 2] || "");
+				const username = decodeSafe(pathParts[pathParts.length - 2] || "");
 				const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE").bind(username).first();
 				if (!user) {
 					return new Response(JSON.stringify({ error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
 				}
 				const host = url.hostname;
-				const links = buildAllConfigLinks(user, host);
-				return new Response(JSON.stringify({ links, count: links.length, trex: isTrexFrag(user), frag_len: user.frag_len || "" }), {
+				const links = configLinks(user, host);
+				return new Response(JSON.stringify({ links, count: links.length, trex: isFluxFrag(user), frag_len: user.frag_len || "" }), {
 					headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
 				});
 			}
 			const isUserAction = pathParts.length > 2;
 			if (isUserAction) {
-				const username = safeDecodeURI(pathParts[pathParts.length - 1]);
+				const username = decodeSafe(pathParts[pathParts.length - 1]);
 				if (request.method === "PUT") {
-					const body = await readJsonBody(request);
+					const body = await readJson(request);
 					if (Object.keys(body).length === 0) {
 						return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -1651,10 +1633,10 @@ const Router = {
 					} else if (body.reset_action !== undefined) {
 						if (body.reset_action === "volume") {
 							await env.DB.prepare("UPDATE users SET used_gb = 0, is_active = 1 WHERE username = ?").bind(username).run();
-							tbTrafficMap.set(username, 0);
+							state.traffic.set(username, 0);
 						} else if (body.reset_action === "req") {
 							await env.DB.prepare("UPDATE users SET used_req = 0, is_active = 1 WHERE username = ?").bind(username).run();
-							tbReqCache.set(username, 0);
+							state.reqCache.set(username, 0);
 						} else if (body.reset_action === "time") {
 							await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP, is_active = 1 WHERE username = ?").bind(username).run();
 						}
@@ -1669,21 +1651,21 @@ const Router = {
 							if (existing) {
 								return new Response(JSON.stringify({ error: "Username already exists" }), { status: 400, headers: { "Content-Type": "application/json" } });
 							}
-							if (tbTrafficMap.has(username)) {
-								tbTrafficMap.set(new_username, tbTrafficMap.get(username));
-								tbTrafficMap.delete(username);
+							if (state.traffic.has(username)) {
+								state.traffic.set(new_username, state.traffic.get(username));
+								state.traffic.delete(username);
 							}
-							if (tbReqCache.has(username)) {
-								tbReqCache.set(new_username, tbReqCache.get(username));
-								tbReqCache.delete(username);
+							if (state.reqCache.has(username)) {
+								state.reqCache.set(new_username, state.reqCache.get(username));
+								state.reqCache.delete(username);
 							}
-							if (tbConnCount.has(username)) {
-								tbConnCount.set(new_username, tbConnCount.get(username));
-								tbConnCount.delete(username);
+							if (state.connections.has(username)) {
+								state.connections.set(new_username, state.connections.get(username));
+								state.connections.delete(username);
 							}
-							if (tbLastActive.has(username)) {
-								tbLastActive.set(new_username, tbLastActive.get(username));
-								tbLastActive.delete(username);
+							if (state.lastActive.has(username)) {
+								state.lastActive.set(new_username, state.lastActive.get(username));
+								state.lastActive.delete(username);
 							}
 						}
 						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ? WHERE username = ?")
@@ -1706,13 +1688,13 @@ const Router = {
 						const now = Date.now();
 						const enrichedUsers = (results || []).map((user) => {
 							const uname = user.username;
-							const memBytes = tbTrafficMap.get(uname) || 0;
+							const memBytes = state.traffic.get(uname) || 0;
 							const memGb = memBytes / (1024 * 1024 * 1024);
-							const memReqs = tbReqCache.get(uname) || 0;
-							const connN = tbConnCount.get(uname) || 0;
+							const memReqs = state.reqCache.get(uname) || 0;
+							const connN = state.connections.get(uname) || 0;
 							const ipOnline = getActiveIpCount(user.active_ips);
 							const onlineN = Math.max(ipOnline, connN);
-							const lastAct = Math.max(Number(user.last_active) || 0, tbLastActive.get(uname) || 0);
+							const lastAct = Math.max(Number(user.last_active) || 0, state.lastActive.get(uname) || 0);
 							const isOn = onlineN > 0 || (lastAct && now - lastAct < 60000) ? 1 : 0;
 							return {
 								...user,
@@ -1725,7 +1707,7 @@ const Router = {
 						});
 						let cfReqs = { today: 0, total: 0, limit: 100000 };
 						try {
-							const cachedToday = (CF_REQ_CACHE.base || 0) + (CF_REQ_CACHE.delta || 0);
+							const cachedToday = (state.cfReq.base || 0) + (state.cfReq.delta || 0);
 							if (cachedToday > 0) {
 								cfReqs.today = cachedToday;
 								cfReqs.total = cachedToday;
@@ -1740,11 +1722,11 @@ const Router = {
 									const todayRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first();
 									dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
 								}
-								cfReqs.today = dbToday + tbReqTotal;
-								cfReqs.total = dbTotal + tbReqTotal;
+								cfReqs.today = dbToday + state.reqTotal;
+								cfReqs.total = dbTotal + state.reqTotal;
 							}
 							const CACHE_MS = 45000;
-							const needsRefresh = !CF_REQ_CACHE.fetchedAt || Date.now() - CF_REQ_CACHE.fetchedAt >= CACHE_MS;
+							const needsRefresh = !state.cfReq.fetchedAt || Date.now() - state.cfReq.fetchedAt >= CACHE_MS;
 							if (needsRefresh && ctx) {
 								ctx.waitUntil(fetchCfAccountRequestsToday(env).catch(() => {}));
 							}
@@ -1784,7 +1766,7 @@ const Router = {
 					}
 				}
 				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy } = await readJsonBody(request);
+					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy } = await readJson(request);
 					if (!username) {
 						return new Response(JSON.stringify({ error: "Username is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
 					}
@@ -1821,7 +1803,7 @@ const Router = {
 						const todayUtc = Math.floor(Date.now() / 86400000) * 86400000;
 						const nowTime = Date.now();
 						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob(String.fromCharCode(100,109,120,108,99,51,77,61)), tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, (frag_len !== undefined && frag_len !== null && String(frag_len).trim() !== "") ? (typeof frag_len === "object" ? JSON.stringify(frag_len) : String(frag_len)) : TREX_FRAG_JSON, frag_int !== undefined && frag_int !== null ? String(frag_int) : "", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0)
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob(String.fromCharCode(100,109,120,108,99,51,77,61)), tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, (frag_len !== undefined && frag_len !== null && String(frag_len).trim() !== "") ? (typeof frag_len === "object" ? JSON.stringify(frag_len) : String(frag_len)) : FLUX_JSON, frag_int !== undefined && frag_int !== null ? String(frag_int) : "", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0)
 							.run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} catch (err) {
@@ -1836,6 +1818,7 @@ const Router = {
 let schemaEnsured = false;
 let schemaPromise = null;
 let cachedPanelPassword = null;
+/* ── D1 database ── */
 const DbService = {
 	async ensureSchema(db) {
 		if (schemaEnsured) return;
@@ -1952,9 +1935,10 @@ function getActiveIpCount(activeIpsJson) {
 		return 0;
 	}
 }
+/* ── subscription ── */
 const SubscriptionService = {
 	async generateText(user, host) {
-		const links = buildAllConfigLinks(user, host) || [];
+		const links = configLinks(user, host) || [];
 		const NL = String.fromCharCode(10);
 		const noise = [
 			"# System Update Feed: OK",
@@ -1981,7 +1965,7 @@ const SubscriptionService = {
 		});
 	},
 	async generateHtml(user, host) {
-		const links = buildAllConfigLinks(user, host) || [];
+		const links = configLinks(user, host) || [];
 		const used = Number(user.used_gb) || 0;
 		const limit = user.limit_gb != null && user.limit_gb !== "" ? Number(user.limit_gb) : null;
 		const usedLabel = used < 1 ? (used * 1024).toFixed(0) + " Mb" : used.toFixed(2) + " Gb";
@@ -2122,42 +2106,42 @@ document.getElementById("toggleQr").onclick=function(){
 };
 async function flushExpiredTraffic(env) {
 	const now = Date.now();
-	for (const [key, val] of tbDnsCache.entries()) {
-		if (now > val.expires) tbDnsCache.delete(key);
+	for (const [key, val] of state.dnsCache.entries()) {
+		if (now > val.expires) state.dnsCache.delete(key);
 	}
-	for (const [ip, record] of tbLoginAttempts.entries()) {
-		if (now - record.lastAttempt > 900000) tbLoginAttempts.delete(ip);
+	for (const [ip, record] of state.loginAttempts.entries()) {
+		if (now - record.lastAttempt > 900000) state.loginAttempts.delete(ip);
 	}
-	const allUsers = new Set([...tbTrafficMap.keys(), ...tbReqCache.keys()]);
+	const allUsers = new Set([...state.traffic.keys(), ...state.reqCache.keys()]);
 	for (const uname of allUsers) {
-		const cachedBytes = tbTrafficMap.get(uname) || 0;
-		const cachedReqs = tbReqCache.get(uname) || 0;
-		const activeCount = tbConnCount.get(uname) || 0;
+		const cachedBytes = state.traffic.get(uname) || 0;
+		const cachedReqs = state.reqCache.get(uname) || 0;
+		const activeCount = state.connections.get(uname) || 0;
 		if (cachedBytes <= 0 && cachedReqs <= 0) {
-			tbTrafficMap.delete(uname);
-			tbReqCache.delete(uname);
+			state.traffic.delete(uname);
+			state.reqCache.delete(uname);
 			if (activeCount <= 0) {
-				tbLastActive.delete(uname);
-				tbLastActive.delete(uname + "_hb");
+				state.lastActive.delete(uname);
+				state.lastActive.delete(uname + "_hb");
 			}
 			continue;
 		}
-		if (tbWriteLock.get(uname)) continue;
-		const lastActive = tbLastActive.get(uname) || 0;
+		if (state.writeLock.get(uname)) continue;
+		const lastActive = state.lastActive.get(uname) || 0;
 		if (activeCount <= 0 || now - lastActive > 20000) {
-			tbWriteLock.set(uname, true);
-			tbTrafficMap.set(uname, 0);
-			tbReqCache.set(uname, 0);
+			state.writeLock.set(uname, true);
+			state.traffic.set(uname, 0);
+			state.reqCache.set(uname, 0);
 			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
 			try {
 				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, uname).run();
 			} catch (e) {
 				console.error(e.message);
 			} finally {
-				tbWriteLock.delete(uname);
+				state.writeLock.delete(uname);
 				if (activeCount <= 0) {
-					tbLastActive.delete(uname);
-					tbLastActive.delete(uname + "_hb");
+					state.lastActive.delete(uname);
+					state.lastActive.delete(uname + "_hb");
 				}
 			}
 		}
@@ -2587,7 +2571,7 @@ async function buildExitProxiesForCountry(cc, maxTest = 40, topN = 12, force = f
 		while (vIdx < toVerify.length) {
 			const i = vIdx++;
 			const item = toVerify[i];
-			const ok = await testProxyAlive(item.proxy, 800);
+			const ok = await isProxyLive(item.proxy, 800);
 			if (!ok) continue;
 			item.verified = true;
 			verified.push(item);
@@ -2649,7 +2633,7 @@ async function pickRandomExitProxy(maxTry = 24) {
 		const start = Date.now();
 		let ok = false;
 		try {
-			ok = await testProxyAlive(proxy, 800);
+			ok = await isProxyLive(proxy, 800);
 		} catch (e) {
 			ok = false;
 		}
@@ -2705,14 +2689,14 @@ function normalizeProxyUrl(proxy, protocolHint) {
 	if (proto.includes("socks4")) return "socks4://" + p;
 	return "socks5://" + p;
 }
-async function testProxyAlive(proxyUrl, timeoutMs = 900) {
+async function isProxyLive(proxyUrl, timeoutMs = 900) {
 	if (!proxyUrl) return false;
 	let sock = null;
 	const timeoutId = setTimeout(() => {
 		try { sock && sock.close(); } catch (e) {}
 	}, timeoutMs);
 	try {
-		const payload = TEXT_ENCODER.encode("GET /cdn-cgi/trace HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n");
+		const payload = UTF8.encode("GET /cdn-cgi/trace HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n");
 		sock = await connectProxy(proxyUrl, "cloudflare.com", 80, payload);
 		const reader = sock.readable.getReader();
 		let buf = new Uint8Array(0);
@@ -2739,7 +2723,7 @@ async function testProxyAlive(proxyUrl, timeoutMs = 900) {
 		try { reader.releaseLock(); } catch (eR) {}
 		try { sock.close(); } catch (e) {}
 		if (!buf.length) return false;
-		const text = TEXT_DECODER.decode(buf.slice(0, Math.min(buf.length, 220)));
+		const text = FROM_UTF8.decode(buf.slice(0, Math.min(buf.length, 220)));
 		if (/HTTP\/\d/i.test(text) || /fl=|ip=|colo=/i.test(text) || buf.length >= 16) return true;
 		return false;
 	} catch (e) {
@@ -2784,7 +2768,7 @@ async function pickProxiflyProxy(countryCode, maxTest = 8) {
 		let proxy = item.proxy || (item.ip + ":" + item.port);
 		proxy = normalizeProxyUrl(proxy, item.protocol);
 		if (!proxy) continue;
-		const ok = await testProxyAlive(proxy, 900);
+		const ok = await isProxyLive(proxy, 900);
 		if (ok) return proxy;
 	}
 	return "";
@@ -2805,24 +2789,12 @@ function userHasExitLock(user) {
 	const cc = (user?.user_proxy_iata || "").trim().toUpperCase();
 	return !!(cc && cc !== "OFF" && cc !== "NONE" && cc !== "CF" && cc !== "AUTO");
 }
-function tbBase64UrlToBytes(b64url) {
-	try {
-		let s = String(b64url || "").replace(/-/g, "+").replace(/_/g, "/");
-		while (s.length % 4) s += "=";
-		const bin = atob(s);
-		const out = new Uint8Array(bin.length);
-		for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-		return out;
-	} catch (e) {
-		return null;
-	}
-}
-async function handlevIees(env, _unused = null, ctx = null, request = null) {
+async function handleVless(env, _unused = null, ctx = null, request = null) {
 	try {
 	// soft concurrent limit per isolate — drop quietly instead of crashing (avoids 1101)
 	try {
 		let live = 0;
-		for (const n of tbConnCount.values()) live += n || 0;
+		for (const n of state.connections.values()) live += n || 0;
 		if (live > 180) {
 			return new Response(null, { status: 503, headers: { "Retry-After": "3" } });
 		}
@@ -2861,50 +2833,50 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 			bytes += uncountedBytes;
 			uncountedBytes = 0;
 		}
-		let current = tbTrafficMap.get(username) || 0;
-		tbTrafficMap.set(username, current + bytes);
-		tbLastActive.set(username, Date.now());
+		let current = state.traffic.get(username) || 0;
+		state.traffic.set(username, current + bytes);
+		state.lastActive.set(username, Date.now());
 		// prevent unbounded Map growth under high churn
-		if (tbTrafficMap.size > 4000) {
+		if (state.traffic.size > 4000) {
 			try {
 				const nowP = Date.now();
-				for (const [k, ts] of tbLastActive) {
+				for (const [k, ts] of state.lastActive) {
 					if (nowP - (ts || 0) > 120000) {
-						tbTrafficMap.delete(k);
-						tbLastActive.delete(k);
-						tbReqCache.delete(k);
-						tbWriteLock.delete(k);
-						tbLastWrite.delete(k);
-						tbConnCount.delete(k);
+						state.traffic.delete(k);
+						state.lastActive.delete(k);
+						state.reqCache.delete(k);
+						state.writeLock.delete(k);
+						state.lastWrite.delete(k);
+						state.connections.delete(k);
 					}
 				}
 			} catch (_) {}
 		}
-		if (tbWriteLock.get(username)) return;
-		let lastDbWrite = tbLastWrite.get(username) || 0;
+		if (state.writeLock.get(username)) return;
+		let lastDbWrite = state.lastWrite.get(username) || 0;
 		let now = Date.now();
 		let thresholdBytes = 100 * 1024 * 1024;
 		if ((current >= thresholdBytes && now - lastDbWrite > 20000) || (current > 0 && now - lastDbWrite > 120000)) {
-			tbWriteLock.set(username, true);
-			let toCommit = tbTrafficMap.get(username) || 0;
-			let toCommitReq = tbReqCache.get(username) || 0;
+			state.writeLock.set(username, true);
+			let toCommit = state.traffic.get(username) || 0;
+			let toCommitReq = state.reqCache.get(username) || 0;
 			if (toCommit <= 0 && toCommitReq <= 0) {
-				tbWriteLock.set(username, false);
+				state.writeLock.set(username, false);
 				return;
 			}
-			tbTrafficMap.set(username, (tbTrafficMap.get(username) || 0) - toCommit);
-			tbReqCache.set(username, (tbReqCache.get(username) || 0) - toCommitReq);
-			tbLastWrite.set(username, now);
+			state.traffic.set(username, (state.traffic.get(username) || 0) - toCommit);
+			state.reqCache.set(username, (state.reqCache.get(username) || 0) - toCommitReq);
+			state.lastWrite.set(username, now);
 			let deltaGb = toCommit / (1024 * 1024 * 1024);
 			let writeTask = async () => {
 				try {
 					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, username).run();
 				} catch (e) {
 					console.error(e.message);
-					tbTrafficMap.set(username, (tbTrafficMap.get(username) || 0) + toCommit);
-					tbReqCache.set(username, (tbReqCache.get(username) || 0) + toCommitReq);
+					state.traffic.set(username, (state.traffic.get(username) || 0) + toCommit);
+					state.reqCache.set(username, (state.reqCache.get(username) || 0) + toCommitReq);
 				} finally {
-					tbWriteLock.set(username, false);
+					state.writeLock.set(username, false);
 				}
 			};
 			if (ctx) ctx.waitUntil(writeTask());
@@ -2943,29 +2915,29 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 			if (ctx) ctx.waitUntil(removeIpTask());
 			else removeIpTask();
 		}
-		let activeCount = tbConnCount.get(uname) || 0;
+		let activeCount = state.connections.get(uname) || 0;
 		if (hasCountedAsActive) {
 			activeCount = Math.max(0, activeCount - 1);
 		}
 		if (activeCount <= 0) {
-			tbConnCount.delete(uname);
-			let cachedBytes = tbTrafficMap.get(uname) || 0;
-			let cachedReqs = tbReqCache.get(uname) || 0;
-			if ((cachedBytes > 0 || cachedReqs > 0) && !tbWriteLock.get(uname)) {
-				tbWriteLock.set(uname, true);
-				tbTrafficMap.set(uname, (tbTrafficMap.get(uname) || 0) - cachedBytes);
-				tbReqCache.set(uname, (tbReqCache.get(uname) || 0) - cachedReqs);
+			state.connections.delete(uname);
+			let cachedBytes = state.traffic.get(uname) || 0;
+			let cachedReqs = state.reqCache.get(uname) || 0;
+			if ((cachedBytes > 0 || cachedReqs > 0) && !state.writeLock.get(uname)) {
+				state.writeLock.set(uname, true);
+				state.traffic.set(uname, (state.traffic.get(uname) || 0) - cachedBytes);
+				state.reqCache.set(uname, (state.reqCache.get(uname) || 0) - cachedReqs);
 				const deltaGb = cachedBytes / (1024 * 1024 * 1024);
 				const writeTask = async () => {
 					try {
 						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, uname).run();
 					} catch (e) {
 						console.error(e.message);
-						tbTrafficMap.set(uname, (tbTrafficMap.get(uname) || 0) + cachedBytes);
-						tbReqCache.set(uname, (tbReqCache.get(uname) || 0) + cachedReqs);
+						state.traffic.set(uname, (state.traffic.get(uname) || 0) + cachedBytes);
+						state.reqCache.set(uname, (state.reqCache.get(uname) || 0) + cachedReqs);
 					} finally {
-						tbWriteLock.delete(uname);
-						tbLastActive.delete(uname);
+						state.writeLock.delete(uname);
+						state.lastActive.delete(uname);
 					}
 				};
 				if (ctx) {
@@ -2974,10 +2946,10 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 					writeTask();
 				}
 			} else {
-				tbLastActive.delete(uname);
+				state.lastActive.delete(uname);
 			}
 		} else {
-			tbConnCount.set(uname, activeCount);
+			state.connections.set(uname, activeCount);
 		}
 	};
 	let heartbeat;
@@ -2990,9 +2962,9 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 					return;
 				}
 				const nowTime = Date.now();
-				const lastCheck = tbLastActive.get(username + "_hb") || 0;
+				const lastCheck = state.lastActive.get(username + "_hb") || 0;
 				if (nowTime - lastCheck >= 20000) {
-					tbLastActive.set(username + "_hb", nowTime);
+					state.lastActive.set(username + "_hb", nowTime);
 					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
 					let isExpired = false;
 					let isIpLimitExpired = false;
@@ -3001,7 +2973,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 						isExpired = true;
 					} else {
 						if (user.limit_gb && user.used_gb >= user.limit_gb) isExpired = true;
-						if (user.limit_req && user.used_req + (tbReqCache.get(username) || 0) >= user.limit_req) isExpired = true;
+						if (user.limit_req && user.used_req + (state.reqCache.get(username) || 0) >= user.limit_req) isExpired = true;
 						if (user.expiry_days && user.created_at) {
 							const expiryDate = new Date(new Date(user.created_at).getTime() + user.expiry_days * 86400000);
 							if (nowTime > expiryDate.getTime()) isExpired = true;
@@ -3182,19 +3154,22 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 					if (request) {
 						const reqUrl = new URL(request.url);
 						const p = reqUrl.pathname || "";
-						const pathOk = !p || p === "/" || p.includes("/api/ws") || p.includes("ws") || p.includes("/api/");
-						// allow path variants from different clients
+						const pathOk = p.includes("/api/ws");
+						if (!pathOk) {
+							serverSock.close();
+							return;
+						}
 					}
 					username = user.username;
 					validUUID = user.uuid;
 					reqUUID = user.uuid;
-					let currentReqs = tbReqCache.get(username) || 0;
-					tbReqCache.set(username, currentReqs + 1);
-					if (!tbTrafficMap.has(username)) tbTrafficMap.set(username, 0);
+					let currentReqs = state.reqCache.get(username) || 0;
+					state.reqCache.set(username, currentReqs + 1);
+					if (!state.traffic.has(username)) state.traffic.set(username, 0);
 					if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) return;
 					if (user.is_active === 0) { serverSock.close(); return; }
 					if (user.limit_gb && user.used_gb >= user.limit_gb) { serverSock.close(); return; }
-					if (user.limit_req && user.used_req + (tbReqCache.get(username) || 0) > user.limit_req) { serverSock.close(); return; }
+					if (user.limit_req && user.used_req + (state.reqCache.get(username) || 0) > user.limit_req) { serverSock.close(); return; }
 					if (user.expiry_days && user.created_at) {
 						const created = new Date(user.created_at);
 						const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
@@ -3255,9 +3230,9 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 								activeIps[clientIP] = { timestamp: now, count: 1 };
 							}
 						}
-						const lastWrite = tbLastActive.get(username) || 0;
+						const lastWrite = state.lastActive.get(username) || 0;
 						if (isNewIp || now - lastWrite > 30000) {
-							tbLastActive.set(username, now);
+							state.lastActive.set(username, now);
 							const updateTask = async () => {
 								try {
 									await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), now, user.uuid).run();
@@ -3268,14 +3243,14 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 						}
 					}
 					isHeaderParsed = true;
-					let activeCount = tbConnCount.get(username) || 0;
-					tbConnCount.set(username, activeCount + 1);
+					let activeCount = state.connections.get(username) || 0;
+					state.connections.set(username, activeCount + 1);
 					hasCountedAsActive = true;
 					if (activeCount === 0) {
 						const setOnlineTask = async () => {
 							try {
 								const now = Date.now();
-								tbLastActive.set(username, now);
+								state.lastActive.set(username, now);
 								await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
 							} catch (e) {}
 						};
@@ -3373,7 +3348,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 							}
 							remoteConnWrapper.socket = s;
 							s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-							connectStreams(s, serverSock, (typeof respHeaderSent !== "undefined" && respHeaderSent) ? null : respHeader, null, addBytes);
+							connectStreams(s, serverSock, respHeader, null, addBytes);
 						})();
 						remoteConnWrapper.connectingPromise = task;
 						try { await task; }
@@ -3416,7 +3391,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 			}
 			let user = null;
 			try {
-				user = await env.DB.prepare("SELECT * FROM users WHERE lower(uuid) = lower(?)").bind(reqUUID).first();
+				user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(reqUUID).first();
 			} catch (e) {}
 			if (!user) {
 				serverSock.close();
@@ -3425,15 +3400,18 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 			if (request) {
 				const reqUrl = new URL(request.url);
 				const p = reqUrl.pathname || "";
-				const pathOk = !p || p === "/" || p.includes("/api/ws") || p.includes("ws") || p.includes("/api/");
-				// allow path variants from different clients
+				const pathOk = p.includes("/api/ws");
+				if (!pathOk) {
+					serverSock.close();
+					return;
+				}
 			}
 			username = user.username;
 			validUUID = reqUUID;
-			let currentReqs = tbReqCache.get(username) || 0;
-			tbReqCache.set(username, currentReqs + 1);
-			if (!tbTrafficMap.has(username)) {
-				tbTrafficMap.set(username, 0);
+			let currentReqs = state.reqCache.get(username) || 0;
+			state.reqCache.set(username, currentReqs + 1);
+			if (!state.traffic.has(username)) {
+				state.traffic.set(username, 0);
 			}
 			if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
 				return;
@@ -3446,7 +3424,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 				serverSock.close();
 				return;
 			}
-			if (user.limit_req && user.used_req + (tbReqCache.get(username) || 0) > user.limit_req) {
+			if (user.limit_req && user.used_req + (state.reqCache.get(username) || 0) > user.limit_req) {
 				serverSock.close();
 				return;
 			}
@@ -3511,9 +3489,9 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 						activeIps[clientIP] = { timestamp: now, count: 1 };
 					}
 				}
-				const lastWrite = tbLastActive.get(username) || 0;
+				const lastWrite = state.lastActive.get(username) || 0;
 				if (isNewIp || now - lastWrite > 30000) {
-					tbLastActive.set(username, now);
+					state.lastActive.set(username, now);
 					const updateTask = async () => {
 						try {
 							await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), now, reqUUID).run();
@@ -3524,14 +3502,14 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 				}
 			}
 			isHeaderParsed = true;
-			let activeCount = tbConnCount.get(username) || 0;
-			tbConnCount.set(username, activeCount + 1);
+			let activeCount = state.connections.get(username) || 0;
+			state.connections.set(username, activeCount + 1);
 			hasCountedAsActive = true;
 			if (activeCount === 0) {
 				const setOnlineTask = async () => {
 					try {
 						const now = Date.now();
-						tbLastActive.set(username, now);
+						state.lastActive.set(username, now);
 						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
 					} catch (e) {}
 				};
@@ -3550,7 +3528,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
 				} else if (addrType === 2) {
 					const domainLen = chunkBuffer[offset++];
-					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
+					addr = FROM_UTF8.decode(chunkBuffer.slice(offset, offset + domainLen));
 					offset += domainLen;
 				} else if (addrType === 3) {
 					const v6 = [];
@@ -3561,11 +3539,6 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 				}
 				const rawData = chunkBuffer.slice(offset);
 				const respHeader = new Uint8Array([chunkBuffer[0], 0]);
-				// CRITICAL: send VLESS response header immediately so client gets handshake (ping works even if remote is slow)
-				try {
-					if (serverSock.readyState === 1) serverSock.send(respHeader);
-				} catch (eHdr) {}
-				const respHeaderSent = true;
 									if (user.__tbBlockHosts && user.__tbBlockHosts.length && addr && !/^\d+\.\d+\.\d+\.\d+$/.test(addr)) {
 						const hl = String(addr).toLowerCase();
 						for (let bi = 0; bi < user.__tbBlockHosts.length; bi++) {
@@ -3657,7 +3630,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 							}
 						remoteConnWrapper.socket = s;
 						s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-						connectStreams(s, serverSock, (typeof respHeaderSent !== "undefined" && respHeaderSent) ? null : respHeader, null, addBytes);
+						connectStreams(s, serverSock, respHeader, null, addBytes);
 					})();
 					remoteConnWrapper.connectingPromise = task;
 					try {
@@ -3694,7 +3667,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 		if (wsStopped || wsFailed) return;
 		let data = event.data;
 		if (typeof data === "string") {
-			data = TEXT_ENCODER.encode(data);
+			data = UTF8.encode(data);
 		} else if (data instanceof ArrayBuffer) {
 			data = new Uint8Array(data);
 		} else if (ArrayBuffer.isView(data)) {
@@ -3706,7 +3679,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 		if (!size) return;
 		const nextBytes = wsQueueBytes + size;
 		const nextItems = wsQueueItems + 1;
-		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+		if (nextBytes > UPSTREAM_QUEUE_BYTES || nextItems > UPSTREAM_QUEUE_ITEMS) {
 			handleWsError(new Error("ws queue overflow"));
 			return;
 		}
@@ -3735,34 +3708,6 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 	serverSock.addEventListener("error", (err) => {
 		handleWsError(err);
 	});
-	// 0-RTT / early data (sec-websocket-protocol)
-	try {
-		const edHeader = (request && request.headers.get("sec-websocket-protocol")) || "";
-		if (edHeader) {
-			const parts = edHeader.split(",").map(function (x) { return String(x || "").trim(); }).filter(Boolean);
-			for (let ei = 0; ei < parts.length; ei++) {
-				let token = parts[ei];
-				if (/^0-/.test(token)) token = token.slice(2);
-				const edBytes = tbBase64UrlToBytes(token);
-				if (edBytes && edBytes.byteLength >= 18) {
-					const size = edBytes.byteLength;
-					const nextBytes = wsQueueBytes + size;
-					const nextItems = wsQueueItems + 1;
-					if (nextBytes <= UPSTREAM_QUEUE_MAX_BYTES && nextItems <= UPSTREAM_QUEUE_MAX_ITEMS) {
-						wsQueueBytes = nextBytes;
-						wsQueueItems = nextItems;
-						pushToChain(async () => {
-							wsQueueBytes = Math.max(0, wsQueueBytes - size);
-							wsQueueItems = Math.max(0, wsQueueItems - 1);
-							if (wsFailed) return;
-							await processWsMessage(edBytes);
-						});
-					}
-					break;
-				}
-			}
-		}
-	} catch (eEd) {}
 	return new Response(null, { status: 101, webSocket: clientSock });
 	} catch (outerErr) {
 		try {
@@ -3812,12 +3757,12 @@ function closeSocketQuietly(socket) {
 		}
 	} catch (e) {}
 }
-async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
+async function dohQuery(domain, recordType, targetDoh = DOH_URL) {
 	const cacheKey = `${domain}:${recordType}:${targetDoh}`;
-	if (tbDnsCache.has(cacheKey)) {
-		const cached = tbDnsCache.get(cacheKey);
+	if (state.dnsCache.has(cacheKey)) {
+		const cached = state.dnsCache.get(cacheKey);
 		if (Date.now() < cached.expires) return cached.data;
-		tbDnsCache.delete(cacheKey);
+		state.dnsCache.delete(cacheKey);
 	}
 	try {
 		const typeMap = { A: 1, AAAA: 28 };
@@ -3826,7 +3771,7 @@ async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
 			const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
 			const bufs = [];
 			for (const label of parts) {
-				const enc = TEXT_ENCODER.encode(label);
+				const enc = UTF8.encode(label);
 				bufs.push(new Uint8Array([enc.length]), enc);
 			}
 			bufs.push(new Uint8Array([0]));
@@ -3872,7 +3817,7 @@ async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
 					jumped = true;
 					continue;
 				}
-				labels.push(TEXT_DECODER.decode(buf.slice(p + 1, p + 1 + len)));
+				labels.push(FROM_UTF8.decode(buf.slice(p + 1, p + 1 + len)));
 				p += len + 1;
 			}
 			if (endPos === -1) endPos = p + 1;
@@ -3910,11 +3855,11 @@ async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
 			}
 			answers.push({ name, type, TTL: ttl, data });
 		}
-		if (tbDnsCache.size >= TB_DNS_MAX) {
-			const oldestKey = tbDnsCache.keys().next().value;
-			if (oldestKey !== undefined) tbDnsCache.delete(oldestKey);
+		if (state.dnsCache.size >= DNS_MAX) {
+			const oldestKey = state.dnsCache.keys().next().value;
+			if (oldestKey !== undefined) state.dnsCache.delete(oldestKey);
 		}
-		tbDnsCache.set(cacheKey, { data: answers, expires: Date.now() + TB_DNS_TTL });
+		state.dnsCache.set(cacheKey, { data: answers, expires: Date.now() + DNS_TTL_MS });
 		return answers;
 	} catch (e) {
 		return [];
@@ -3979,7 +3924,7 @@ function createUpstreamQueue({ getWriter, releaseWriter, retryConnect, closeConn
 	const bundle = () => {
 		const first = shift();
 		if (!first) return null;
-		if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE_TARGET_BYTES) return first;
+		if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE) return first;
 		let byteLength = first.chunk.byteLength;
 		let end = head;
 		let allowRetry = first.allowRetry;
@@ -3987,14 +3932,14 @@ function createUpstreamQueue({ getWriter, releaseWriter, retryConnect, closeConn
 		while (end < chunks.length) {
 			const next = chunks[end];
 			const nextLength = byteLength + next.chunk.byteLength;
-			if (nextLength > UPSTREAM_BUNDLE_TARGET_BYTES) break;
+			if (nextLength > UPSTREAM_BUNDLE) break;
 			byteLength = nextLength;
 			allowRetry = allowRetry && next.allowRetry;
 			if (next.completions) completions = completions ? completions.concat(next.completions) : next.completions;
 			end++;
 		}
 		if (end === head) return first;
-		const output = (bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE_TARGET_BYTES));
+		const output = (bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE));
 		output.set(first.chunk);
 		let offset = first.chunk.byteLength;
 		while (head < end) {
@@ -4063,7 +4008,7 @@ function createUpstreamQueue({ getWriter, releaseWriter, retryConnect, closeConn
 		if (!chunk.byteLength) return true;
 		const nextBytes = queuedBytes + chunk.byteLength;
 		const nextItems = chunks.length - head + 1;
-		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
+		if (nextBytes > UPSTREAM_QUEUE_BYTES || nextItems > UPSTREAM_QUEUE_ITEMS) {
 			closed = true;
 			const err = Object.assign(new Error(`${name}: upload queue overflow`), { isQueueOverflow: true });
 			clear(err);
@@ -4233,7 +4178,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 				if (!value || value.byteLength === 0) continue;
 				hasData = true;
 				if (typeof onBytes === "function") onBytes(value.byteLength);
-				if (value.byteLength >= DOWNSTREAM_GRAIN_BYTES) {
+				if (value.byteLength >= DOWNSTREAM_GRAIN) {
 					await downstreamSender.flush();
 					await downstreamSender.sendDirect(value);
 					readBuffer = new ArrayBuffer(BYOB_LIMIT);
@@ -4258,7 +4203,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 }
 async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
 	const socket = connect({ hostname: address, port: port });
-	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 8000))]);
+	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500))]);
 	if (initialData && initialData.byteLength > 0) {
 		const w = socket.writable.getWriter();
 		await w.write(convertToUint8Array(initialData));
@@ -4330,7 +4275,7 @@ function sha224Hex(message) {
 		0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
 		0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
 	];
-	const msg = typeof message === "string" ? TEXT_ENCODER.encode(message) : message;
+	const msg = typeof message === "string" ? UTF8.encode(message) : message;
 	const l = msg.length;
 	const bitLen = l * 8;
 	const totalLen = ((l + 9 + 63) & ~63);
@@ -4377,7 +4322,7 @@ function isLikelyAuthHeader(buf) {
 }
 function parseAuthHeader(buf) {
 	if (!isLikelyAuthHeader(buf)) return null;
-	const hash = TEXT_DECODER.decode(buf.slice(0, 56)).toLowerCase();
+	const hash = FROM_UTF8.decode(buf.slice(0, 56)).toLowerCase();
 	let offset = 58;
 	if (buf.byteLength < offset + 2) return { needMore: true };
 	const cmd = buf[offset++];
@@ -4390,7 +4335,7 @@ function parseAuthHeader(buf) {
 		if (buf.byteLength < offset + 1) return { needMore: true };
 		const len = buf[offset++];
 		if (buf.byteLength < offset + len + 2 + 2) return { needMore: true };
-		addr = TEXT_DECODER.decode(buf.slice(offset, offset + len));
+		addr = FROM_UTF8.decode(buf.slice(offset, offset + len));
 		offset += len;
 	} else if (atyp === 0x04) {
 		if (buf.byteLength < offset + 16 + 2 + 2) return { needMore: true };
@@ -4416,16 +4361,16 @@ async function fetchCfAccountRequestsToday(env) {
 		const mo = String(now.getUTCMonth() + 1).padStart(2, "0");
 		const da = String(now.getUTCDate()).padStart(2, "0");
 		const dayKey = y + "-" + mo + "-" + da;
-		if (CF_REQ_CACHE.day && CF_REQ_CACHE.day !== dayKey) {
-			CF_REQ_CACHE.day = dayKey;
-			CF_REQ_CACHE.base = 0;
-			CF_REQ_CACHE.fetchedAt = 0;
-			CF_REQ_CACHE.delta = 0;
+		if (state.cfReq.day && state.cfReq.day !== dayKey) {
+			state.cfReq.day = dayKey;
+			state.cfReq.base = 0;
+			state.cfReq.fetchedAt = 0;
+			state.cfReq.delta = 0;
 		}
-		CF_REQ_CACHE.day = dayKey;
+		state.cfReq.day = dayKey;
 
 		const CACHE_MS = 45000;
-		const freshEnough = CF_REQ_CACHE.fetchedAt && Date.now() - CF_REQ_CACHE.fetchedAt < CACHE_MS;
+		const freshEnough = state.cfReq.fetchedAt && Date.now() - state.cfReq.fetchedAt < CACHE_MS;
 
 		if (!freshEnough) {
 			let token = env.CF_API_TOKEN || null;
@@ -4526,31 +4471,31 @@ async function fetchCfAccountRequestsToday(env) {
 									: [];
 						}
 						const live = sumGroups(groups);
-						const localNow = (CF_REQ_CACHE.base || 0) + (CF_REQ_CACHE.delta || 0);
-						CF_REQ_CACHE.base = Math.max(live, localNow);
-						CF_REQ_CACHE.delta = 0;
-						CF_REQ_CACHE.fetchedAt = Date.now();
+						const localNow = (state.cfReq.base || 0) + (state.cfReq.delta || 0);
+						state.cfReq.base = Math.max(live, localNow);
+						state.cfReq.delta = 0;
+						state.cfReq.fetchedAt = Date.now();
 					} catch (e) {}
 				}
 			}
 		}
 
-		const today = (CF_REQ_CACHE.base || 0) + (CF_REQ_CACHE.delta || 0);
+		const today = (state.cfReq.base || 0) + (state.cfReq.delta || 0);
 		return { today: today, limit: 100000 };
 	} catch (e) {
-		const today = (CF_REQ_CACHE.base || 0) + (CF_REQ_CACHE.delta || 0);
+		const today = (state.cfReq.base || 0) + (state.cfReq.delta || 0);
 		return { today: today, limit: 100000 };
 	}
 }
 
 function trackRequest(env, ctx) {
-	tbReqTotal++;
-	CF_REQ_CACHE.delta = (CF_REQ_CACHE.delta || 0) + 1;
+	state.reqTotal++;
+	state.cfReq.delta = (state.cfReq.delta || 0) + 1;
 	const now = Date.now();
-	if ((now - tbLastReqWrite > 900000 || tbReqTotal > 5000) && tbReqTotal > 0) {
-		tbLastReqWrite = now;
-		const countToSave = tbReqTotal;
-		tbReqTotal = 0;
+	if ((now - state.lastReqWrite > 900000 || state.reqTotal > 5000) && state.reqTotal > 0) {
+		state.lastReqWrite = now;
+		const countToSave = state.reqTotal;
+		state.reqTotal = 0;
 		const task = async () => {
 			try {
 				const today = new Date().toISOString().split("T")[0];
@@ -4804,6 +4749,7 @@ async function connectHttp(proxyStr, destAddr, destPort, initialData) {
 		throw e;
 	}
 }
+/* ── HTML UI ── */
 const HTML_TEMPLATES = {
 	nginx: `<!DOCTYPE html>
 <html lang="en" dir="ltr">
@@ -5009,7 +4955,6 @@ setup: `<!DOCTYPE html>
     background-size: 24px 24px;
     background-attachment:fixed !important;
   }
-
 
   .brand-bridge {
     padding-left: 9px;
@@ -6201,8 +6146,6 @@ document.getElementById("setupForm").addEventListener("submit", async function (
     }
     .chip-pick {
 
-
-
       flex: 1;
       min-width: 3.5rem;
       height: 44px;
@@ -6261,7 +6204,6 @@ document.getElementById("setupForm").addEventListener("submit", async function (
     .chip-pick:hover { filter: brightness(1.03); }
     .chip-pick:active { transform: translate(2px,2px); box-shadow: 1px 1px 0 #000; }
     .seg button.on { background: #facc15 !important; }
-
 
     .seg button:hover:not(.on) { background: #f5f0e8; }
     .nb-tabs {
@@ -8318,10 +8260,10 @@ function CreateView({
         });
         const j = await res.json().catch(() => ({}));
         const ms = j.ms != null ? j.ms : j.ping;
-        const loc = (j.loc || j.countryName || j.country || j.countryCode || "").toString();
-        if (res.ok && j.ok !== false && j.success !== false) {
+        const loc = (j.country || j.loc || j.countryCode || "").toString().toUpperCase();
+        if (res.ok) {
           setExitStatus((ms != null ? ms + " ms" : "") + (loc ? (ms != null ? " · " : "") + loc : ""));
-          onToast((ms != null ? ms + " ms" : "ok") + (loc ? " · " + loc : ""), "ping");
+          onToast("ms " + (ms != null ? ms : "?") + (loc ? " " + loc : ""), "ping");
         } else {
           setExitStatus("");
           onToast(j.error || "Ping failed", true);
@@ -8360,12 +8302,8 @@ function CreateView({
         if (j && j.proxy) {
           proxyVal = typeof j.proxy === "string" ? j.proxy : (j.proxy.proxy || j.proxy.url || null);
         }
-        if (!res.ok) {
-          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "Random failed", true);
-          return;
-        }
-        if (!proxyVal || j.live === false) {
-          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "Offline — next", true);
+        if (!res.ok || !proxyVal) {
+          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "No live proxy — try again", true);
           return;
         }
         setExitProxy(proxyVal);
@@ -8374,7 +8312,7 @@ function CreateView({
         setExitCountry(loc || "");
         setExitStatus((ms != null ? ms + " ms" : "") + (loc ? (ms != null ? " · " : "") + loc : ""));
         if (mySeq === window.__tbRandSeq) {
-          onToast((ms != null ? ms + " ms" : "OK") + (loc ? " · " + loc : ""), "ping");
+          onToast((ms != null ? ms + " ms" : "OK") + (loc ? " · " + loc : " · ?"), "ping");
         }
       } catch (e) {
         if (mySeq === window.__tbRandSeq) onToast("Random failed — try again", true);
@@ -9365,7 +9303,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
     }
   } catch(e) {}
   var links = [];
-  function toBoldSans(str) {
+  function boldSans(str) {
     var out = "";
     for (var bi = 0; bi < String(str || "").length; bi++) {
       var c = String(str).charCodeAt(bi);
@@ -9386,7 +9324,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
     } else {
       namePart = uname;
     }
-    return "🦖 - " + toBoldSans("TrexBridge") + "-" + toBoldSans(namePart);
+    return "🦖 - " + boldSans("TrexBridge") + "-" + boldSans(namePart);
   }
   if (!fragQ || fragQ.indexOf("fragment=") < 0) {
     fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") + "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
@@ -9564,4 +9502,4 @@ document.addEventListener("DOMContentLoaded", function() {
 `,
 };
 
-export default __WORKER_EXPORT__
+export default WorkerApp
