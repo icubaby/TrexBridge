@@ -3319,7 +3319,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 							}
 							remoteConnWrapper.socket = s;
 							s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-							connectStreams(s, serverSock, respHeader, null, addBytes);
+							connectStreams(s, serverSock, (typeof respHeaderSent !== "undefined" && respHeaderSent) ? null : respHeader, null, addBytes);
 						})();
 						remoteConnWrapper.connectingPromise = task;
 						try { await task; }
@@ -3509,6 +3509,11 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 				}
 				const rawData = chunkBuffer.slice(offset);
 				const respHeader = new Uint8Array([chunkBuffer[0], 0]);
+				// CRITICAL: send VLESS response header immediately so client gets handshake (ping works even if remote is slow)
+				try {
+					if (serverSock.readyState === 1) serverSock.send(respHeader);
+				} catch (eHdr) {}
+				const respHeaderSent = true;
 									if (user.__tbBlockHosts && user.__tbBlockHosts.length && addr && !/^\d+\.\d+\.\d+\.\d+$/.test(addr)) {
 						const hl = String(addr).toLowerCase();
 						for (let bi = 0; bi < user.__tbBlockHosts.length; bi++) {
@@ -3600,7 +3605,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 							}
 						remoteConnWrapper.socket = s;
 						s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-						connectStreams(s, serverSock, respHeader, null, addBytes);
+						connectStreams(s, serverSock, (typeof respHeaderSent !== "undefined" && respHeaderSent) ? null : respHeader, null, addBytes);
 					})();
 					remoteConnWrapper.connectingPromise = task;
 					try {
@@ -4202,7 +4207,7 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 }
 async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
 	const socket = connect({ hostname: address, port: port });
-	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500))]);
+	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 8000))]);
 	if (initialData && initialData.byteLength > 0) {
 		const w = socket.writable.getWriter();
 		await w.write(convertToUint8Array(initialData));
@@ -9340,7 +9345,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
         var remarkV = buildRemark("vless");
         links.push({ url: "vless://" + (u.uuid || "") + "@" + ip + ":" + portStr
           + "?path=" + path + "&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host
-          + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + fragQ
+          + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + "&ed=2560" + fragQ
           + "#" + encodeURIComponent(remarkV) });
       }
       if (fProtos.indexOf("trojan") >= 0) {
@@ -9348,7 +9353,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
         var remarkT = buildRemark("trojan");
         links.push({ url: "trojan://" + (u.uuid || "") + "@" + ip + ":" + portStr
           + "?path=" + path + "&security=" + tlsVal + "&type=ws&host=" + host + "&fp=" + fp
-          + "&sni=" + host + "&allowInsecure=0" + trojanAlpn + fragQ
+          + "&sni=" + host + "&allowInsecure=0" + trojanAlpn + "&ed=2560" + fragQ
           + "#" + encodeURIComponent(remarkT) });
       }
     });
