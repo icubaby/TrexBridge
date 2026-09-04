@@ -189,6 +189,7 @@ function buildAllConfigLinks(user, host) {
 					"&encryption=none&insecure=0&host=" + host +
 					"&fp=" + fp +
 					"&type=ws&allowInsecure=0&sni=" + host +
+					"&ed=2560" +
 					userFrag +
 					"#" + encodeURIComponent(remark)
 				);
@@ -204,6 +205,7 @@ function buildAllConfigLinks(user, host) {
 					"&fp=" + fp +
 					"&sni=" + host +
 					"&allowInsecure=0" + alpn +
+					"&ed=2560" +
 					userFrag +
 					"#" + encodeURIComponent(remark)
 				);
@@ -228,8 +230,8 @@ async function readJsonBody(request) {
 		return {};
 	}
 }
-const CLEAN_IP_JSON_URL = "https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main/data/CleanIP.json";
-const PANEL_REPO_BASE = "https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main";
+const CLEAN_IP_JSON_URL = 'https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main/data/CleanIP.json';
+const PANEL_REPO_BASE = 'https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main';
 async function fetchWithFallback(path, options = {}) {
 	const p = (path || "").replace(/^\/+/, "");
 	if (p === "CleanIP.json" || p === "data/CleanIP.json") {
@@ -953,7 +955,7 @@ const Router = {
 					});
 				}
 				const now = Date.now();
-				const RESET_MS = 10 * 60 * 1000;
+				const RESET_MS = 10 * 60 * 1000; // every 10 minutes restart from top
 				const SRC = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=3000";
 
 				if (!_tbProxyCursor.list.length || now - (_tbProxyCursor.fetchedAt || 0) > RESET_MS) {
@@ -1009,6 +1011,7 @@ const Router = {
 					});
 				}
 
+				// ONE click = ONE proxy (cursor advances every time)
 				const idx = _tbProxyCursor.at % n;
 				const current = list[idx];
 				_tbProxyCursor.at = (idx + 1) % n;
@@ -1417,7 +1420,7 @@ const Router = {
 			const body = await readJsonBody(request);
 			const token = (body.token || "").trim();
 			const adminIds = (body.admin_ids || "").trim();
-			const channel = (body.channel || "@TrexBridgePanel").trim();
+			const channel = (body.channel || "@TrexBridge").trim();
 			if (!token || !adminIds) {
 				return new Response(JSON.stringify({ error: "token and admin_ids are required" }), { status: 400, headers: { "Content-Type": "application/json" } });
 			}
@@ -1509,6 +1512,7 @@ const Router = {
 					});
 				}
 
+				// Ping only (TCP)
 				const t0 = Date.now();
 				let live = false;
 				try {
@@ -1534,6 +1538,7 @@ const Router = {
 					});
 				}
 
+				// Location
 				let country = "";
 				let countryName = "";
 				try {
@@ -2800,7 +2805,6 @@ function userHasExitLock(user) {
 	const cc = (user?.user_proxy_iata || "").trim().toUpperCase();
 	return !!(cc && cc !== "OFF" && cc !== "NONE" && cc !== "CF" && cc !== "AUTO");
 }
-
 function tbBase64UrlToBytes(b64url) {
 	try {
 		let s = String(b64url || "").replace(/-/g, "+").replace(/_/g, "/");
@@ -2813,7 +2817,6 @@ function tbBase64UrlToBytes(b64url) {
 		return null;
 	}
 }
-
 async function handlevIees(env, _unused = null, ctx = null, request = null) {
 	try {
 	// soft concurrent limit per isolate — drop quietly instead of crashing (avoids 1101)
@@ -3180,9 +3183,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 						const reqUrl = new URL(request.url);
 						const p = reqUrl.pathname || "";
 						const pathOk = !p || p === "/" || p.includes("/api/ws") || p.includes("ws") || p.includes("/api/");
-						if (!pathOk) {
-							// still allow — CF workers sometimes receive path variants
-						}
+						// allow path variants from different clients
 					}
 					username = user.username;
 					validUUID = user.uuid;
@@ -3425,9 +3426,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 				const reqUrl = new URL(request.url);
 				const p = reqUrl.pathname || "";
 				const pathOk = !p || p === "/" || p.includes("/api/ws") || p.includes("ws") || p.includes("/api/");
-						if (!pathOk) {
-							// still allow — CF workers sometimes receive path variants
-						}
+				// allow path variants from different clients
 			}
 			username = user.username;
 			validUUID = reqUUID;
@@ -3736,14 +3735,13 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 	serverSock.addEventListener("error", (err) => {
 		handleWsError(err);
 	});
-	// 0-RTT / early data (sec-websocket-protocol) — required by many clients for first VLESS packet
+	// 0-RTT / early data (sec-websocket-protocol)
 	try {
 		const edHeader = (request && request.headers.get("sec-websocket-protocol")) || "";
 		if (edHeader) {
 			const parts = edHeader.split(",").map(function (x) { return String(x || "").trim(); }).filter(Boolean);
 			for (let ei = 0; ei < parts.length; ei++) {
 				let token = parts[ei];
-				// formats: "base64url" or "0-base64url"
 				if (/^0-/.test(token)) token = token.slice(2);
 				const edBytes = tbBase64UrlToBytes(token);
 				if (edBytes && edBytes.byteLength >= 18) {
@@ -7354,7 +7352,7 @@ function UserCard({
         const j = await res.json().catch(() => ({}));
         const links = j.links || [];
         if (!links.length) return onAction("No configs");
-        const ok = await copyText(links.join(String.fromCharCode(10)));
+        const ok = await copyText(links.join("\\n"));
         showToast(ok ? "Config ×" + links.length : "Copy failed", ok ? "copy" : true);
       } catch (e) {
         onAction("Config failed");
@@ -8377,7 +8375,8 @@ function CreateView({
         setExitStatus((ms != null ? ms + " ms" : "") + (loc ? (ms != null ? " · " : "") + loc : ""));
         if (mySeq === window.__tbRandSeq) {
           onToast((ms != null ? ms + " ms" : "OK") + (loc ? " · " + loc : ""), "ping");
-        }      } catch (e) {
+        }
+      } catch (e) {
         if (mySeq === window.__tbRandSeq) onToast("Random failed — try again", true);
       }
     },
@@ -9401,7 +9400,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
         var remarkV = buildRemark("vless");
         links.push({ url: "vless://" + (u.uuid || "") + "@" + ip + ":" + portStr
           + "?path=" + path + "&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host
-          + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + "&ed=2560" + fragQ
+          + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + fragQ
           + "#" + encodeURIComponent(remarkV) });
       }
       if (fProtos.indexOf("trojan") >= 0) {
@@ -9409,7 +9408,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
         var remarkT = buildRemark("trojan");
         links.push({ url: "trojan://" + (u.uuid || "") + "@" + ip + ":" + portStr
           + "?path=" + path + "&security=" + tlsVal + "&type=ws&host=" + host + "&fp=" + fp
-          + "&sni=" + host + "&allowInsecure=0" + trojanAlpn + "&ed=2560" + fragQ
+          + "&sni=" + host + "&allowInsecure=0" + trojanAlpn + fragQ
           + "#" + encodeURIComponent(remarkT) });
       }
     });
