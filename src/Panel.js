@@ -1004,27 +1004,61 @@ const Router = {
 				const idx = _tbProxyCursor.at % n;
 				const current = list[idx];
 				_tbProxyCursor.at = (idx + 1) % n;
-				const pingMs = 2000;
+
+				// Parse host:port for TCP ping (reliable from Workers; full SOCKS-to-CF often false-negatives)
+				let pHost = "";
+				let pPort = 1080;
+				try {
+					let remain = String(current.proxy || "").replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
+					if (remain.startsWith("[")) {
+						const br = remain.indexOf("]");
+						pHost = remain.substring(1, br);
+						pPort = parseInt(remain.substring(br + 2), 10) || 1080;
+					} else {
+						const lc = remain.lastIndexOf(":");
+						if (lc > 0) {
+							pHost = remain.substring(0, lc);
+							pPort = parseInt(remain.substring(lc + 1), 10) || 1080;
+						} else {
+							pHost = remain;
+						}
+					}
+				} catch (eParse) {}
+
 				const tPing = Date.now();
 				let live = false;
 				let ms = 0;
-				try {
-					live = await testProxyAlive(current.proxy, pingMs);
-					ms = Math.max(1, Date.now() - tPing);
-				} catch (ePing) {
-					live = false;
-					ms = Math.max(1, Date.now() - tPing);
-				}
-				let country = current.country || "";
-				if (live && !country) {
+				// 1) TCP open to proxy port — real reachability from CF edge
+				if (pHost) {
 					try {
-						const host = String(current.proxy).replace(/^[a-z0-9]+:\/\//i, "").split(":")[0];
-						country = (await lookupExitCountry(host)) || "";
+						live = await testProxyTcpOpen(pHost, pPort, 2500);
+					} catch (eTcp) {
+						live = false;
+					}
+				}
+				// 2) Optional full tunnel test via 1.1.1.1 (not cloudflare.com)
+				if (!live) {
+					try {
+						live = await testProxyAlive(current.proxy, 2500);
+					} catch (eAlive) {
+						live = false;
+					}
+				}
+				ms = Math.max(1, Date.now() - tPing);
+
+				let country = current.country || "";
+				if (!country && pHost) {
+					try {
+						country = (await lookupExitCountry(pHost)) || "";
 						current.country = country;
 					} catch (eC) {}
 				}
+
+				// Always return 200 so browser does not log 404; live flag tells UI the result
 				if (!live) {
 					return new Response(JSON.stringify({
+						ok: false,
 						error: "Proxy offline — click Random again for next",
 						proxy: current.proxy,
 						ms: ms,
@@ -1033,11 +1067,12 @@ const Router = {
 						live: false,
 						tried: 1
 					}), {
-						status: 404,
+						status: 200,
 						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
 					});
 				}
 				return new Response(JSON.stringify({
+					ok: true,
 					proxy: current.proxy,
 					ms: ms,
 					country: country || "",
@@ -2635,8 +2670,8 @@ async function testProxyAlive(proxyUrl, timeoutMs = 1500) {
 		try { sock && sock.close(); } catch (e) {}
 	}, timeoutMs);
 	try {
-		const payload = TEXT_ENCODER.encode("GET /cdn-cgi/trace HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n");
-		sock = await connectProxy(proxyUrl, "cloudflare.com", 80, payload);
+		const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
+		sock = await connectProxy(proxyUrl, "1.1.1.1", 80, payload);
 		const reader = sock.readable.getReader();
 		let buf = new Uint8Array(0);
 		const deadline = Date.now() + timeoutMs;
@@ -8258,7 +8293,11 @@ function CreateView({
         if (j && j.proxy) {
           proxyVal = typeof j.proxy === "string" ? j.proxy : (j.proxy.proxy || j.proxy.url || null);
         }
-        if (!res.ok || !j.live || !proxyVal) {
+        if (!res.ok) {
+          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "Random failed", true);
+          return;
+        }
+        if (!j.live || !proxyVal) {
           if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "Offline — click Random again", true);
           return;
         }
