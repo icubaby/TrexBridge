@@ -953,8 +953,10 @@ const Router = {
 					});
 				}
 				const now = Date.now();
+				const RESET_MS = 10 * 60 * 1000;
 				const SRC = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=3000";
-				if (!_tbProxyCursor.list.length || now - _tbProxyCursor.fetchedAt > 45000) {
+
+				if (!_tbProxyCursor.list.length || now - (_tbProxyCursor.fetchedAt || 0) > RESET_MS) {
 					const res = await fetch(SRC + "&_=" + now, {
 						headers: {
 							Accept: "text/plain,*/*",
@@ -971,32 +973,33 @@ const Router = {
 					const lines = String(text || "").split(/\r?\n/).map(function (l) { return l.trim(); }).filter(Boolean);
 					const candidates = [];
 					const seen = new Set();
-					for (let li = 0; li < lines.length; li++) {
-						let line = lines[li];
+					for (let i = 0; i < lines.length; i++) {
+						const line = lines[i];
 						if (!line || line.charAt(0) === "#") continue;
-						let proxy = line;
-						// Keep protocol if present; otherwise try both later
-						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) {
-							proxy = "socks5://" + proxy;
+						let protocol = "socks5";
+						let hostport = line;
+						const m = line.match(/^(socks5|socks4|socks|http|https):\/\/(.+)$/i);
+						if (m) {
+							protocol = m[1].toLowerCase() === "socks" ? "socks5" : m[1].toLowerCase();
+							hostport = m[2];
 						}
-						const key = proxy.toLowerCase();
-						if (seen.has(key)) continue;
-						seen.add(key);
+						if (protocol !== "socks5" && protocol !== "socks4") continue;
+						if (!hostport || hostport.indexOf(":") < 0) continue;
+						const proxy = protocol + "://" + hostport;
+						if (seen.has(proxy)) continue;
+						seen.add(proxy);
 						candidates.push({ proxy: proxy, country: "" });
+						if (candidates.length >= 400) break;
 					}
-					candidates.sort(function (a, b) {
-						const as = /socks5/i.test(a.proxy) ? 0 : (/socks4/i.test(a.proxy) ? 1 : 2);
-						const bs = /socks5/i.test(b.proxy) ? 0 : (/socks4/i.test(b.proxy) ? 1 : 2);
-						return as - bs;
-					});
 					if (!candidates.length) {
-						return new Response(JSON.stringify({ error: "No proxies from source" }), {
+						return new Response(JSON.stringify({ error: "Empty proxy list" }), {
 							status: 404,
 							headers: { "Content-Type": "application/json; charset=utf-8" },
 						});
 					}
 					_tbProxyCursor = { list: candidates, at: 0, fetchedAt: now };
 				}
+
 				const list = _tbProxyCursor.list;
 				const n = list.length;
 				if (!n) {
@@ -1005,65 +1008,75 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-				// Sequential cursor: only return REAL verified live proxies
-				const startIdx = _tbProxyCursor.at % n;
-				const maxTry = Math.min(25, n);
-				let winner = null;
-				for (let k = 0; k < maxTry && !winner; k += 5) {
-					const wave = [];
-					for (let j = 0; j < 5 && k + j < maxTry; j++) {
-						const idx = (startIdx + k + j) % n;
-						wave.push({ idx: idx, c: list[idx] });
-					}
-					const results = await Promise.all(
-						wave.map(async function (item) {
-							const tPing = Date.now();
-							try {
-								const ok = await testProxyAlive(item.c.proxy, 900);
-								if (!ok) return null;
-								return { item: item, ms: Math.max(1, Date.now() - tPing) };
-							} catch (e) {
-								return null;
-							}
-						})
-					);
-					for (let ri = 0; ri < results.length; ri++) {
-						if (!results[ri]) continue;
-						const hit = results[ri];
-						const item = hit.item;
-						let country = item.c.country || "";
-						if (!country) {
-							try {
-								const host = String(item.c.proxy).replace(/^[a-z0-9]+:\/\//i, "").split(":")[0];
-								country = (await lookupExitCountry(host)) || "";
-								item.c.country = country;
-							} catch (eC) {}
+
+				const idx = _tbProxyCursor.at % n;
+				const current = list[idx];
+				_tbProxyCursor.at = (idx + 1) % n;
+
+				let pHost = "";
+				let pPort = 1080;
+				try {
+					let remain = String(current.proxy || "").replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
+					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
+					if (remain.startsWith("[")) {
+						const br = remain.indexOf("]");
+						pHost = remain.substring(1, br);
+						pPort = parseInt(remain.substring(br + 2), 10) || 1080;
+					} else {
+						const lc = remain.lastIndexOf(":");
+						if (lc > 0) {
+							pHost = remain.substring(0, lc);
+							pPort = parseInt(remain.substring(lc + 1), 10) || 1080;
+						} else {
+							pHost = remain;
 						}
-						winner = {
-							proxy: item.c.proxy,
-							ms: hit.ms,
-							country: country,
-							index: item.idx,
-						};
-						_tbProxyCursor.at = (item.idx + 1) % n;
-						break;
+					}
+				} catch (eP) {}
+
+				const t0 = Date.now();
+				let live = false;
+				if (pHost) {
+					try {
+						live = await testProxyTcpOpen(pHost, pPort, 2200);
+					} catch (eT) {
+						live = false;
 					}
 				}
-				if (!winner) {
-					_tbProxyCursor.at = (startIdx + maxTry) % n;
-					return new Response(JSON.stringify({ error: "No live proxy found, try again" }), {
-						status: 404,
+				const ms = Math.max(1, Date.now() - t0);
+
+				let country = current.country || "";
+				if (!country && pHost) {
+					try {
+						country = (await lookupExitCountry(pHost)) || "";
+						current.country = country;
+					} catch (eC) {}
+				}
+
+				if (!live) {
+					return new Response(JSON.stringify({
+						ok: false,
+						error: "Proxy offline — click Random again for next",
+						proxy: current.proxy,
+						ms: ms,
+						country: country || "",
+						index: idx,
+						next: _tbProxyCursor.at,
+						live: false
+					}), {
+						status: 200,
 						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
 					});
 				}
+
 				return new Response(JSON.stringify({
-					proxy: winner.proxy,
-					ms: winner.ms,
-					country: winner.country || "",
+					ok: true,
+					proxy: current.proxy,
+					ms: ms,
+					country: country || "",
 					source: "proxyscrape",
 					live: true,
 					verified: true,
-					index: winner.index,
+					index: idx,
 					next: _tbProxyCursor.at
 				}), {
 					headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
@@ -1458,75 +1471,115 @@ const Router = {
 			}
 		}
 		if (url.pathname === "/api/test-proxy" && request.method === "POST") {
-			const { proxy } = await readJsonBody(request);
-			if (!proxy) return new Response(JSON.stringify({ error: "Proxy is not set" }), { status: 400, headers: { "Content-Type": "application/json" } });
+			const body = await readJsonBody(request);
+			const proxy = body && body.proxy ? String(body.proxy).trim() : "";
+			if (!proxy) {
+				return new Response(JSON.stringify({ error: "Proxy is not set" }), {
+					status: 400,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
 			try {
 				let ip = "";
-				let workingProxy = proxy;
+				let port = 1080;
 				if (proxy.includes("t.me/socks") || proxy.includes("tg://socks")) {
-					ip = proxy.match(/server=([^&]+)/)?.[1] || "";
+					ip = (proxy.match(/server=([^&]+)/) || [])[1] || "";
+					port = parseInt((proxy.match(/port=(\d+)/) || [])[1] || "1080", 10) || 1080;
 				} else {
-					let cleanProxy = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-					let remain = cleanProxy;
+					let remain = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
 					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
 					if (remain.startsWith("[")) {
-						ip = remain.substring(1, remain.indexOf("]"));
+						const br = remain.indexOf("]");
+						ip = remain.substring(1, br);
+						port = parseInt(remain.substring(br + 2), 10) || 1080;
 					} else {
-						const lastColon = remain.lastIndexOf(":");
-						if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
-						else ip = remain;
+						const lc = remain.lastIndexOf(":");
+						if (lc > 0) {
+							ip = remain.substring(0, lc);
+							port = parseInt(remain.substring(lc + 1), 10) || 1080;
+						} else {
+							ip = remain;
+						}
 					}
 				}
-				let country = "UN";
-				const startTime = Date.now();
-				const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-				const s = await connectProxy(proxy, "ip-api.com", 80, payload);
-				const reader = s.readable.getReader();
-				let resStr = "";
-				const dec = new TextDecoder();
-				const timeoutId = setTimeout(() => {
-					try {
-						s.close();
-					} catch (e) {}
-				}, 3000);
+				if (!ip) {
+					return new Response(JSON.stringify({ error: "Invalid proxy format" }), {
+						status: 400,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+
+				const t0 = Date.now();
+				let live = false;
 				try {
-					while (true) {
-						const res = await reader.read();
-						if (res.done || !res.value) break;
-						resStr += dec.decode(res.value, { stream: true });
-						if (resStr.includes("countryCode")) break;
+					live = await testProxyTcpOpen(ip, port, 3000);
+				} catch (ePing) {
+					live = false;
+				}
+				const ping = Math.max(1, Date.now() - t0);
+
+				if (!live) {
+					return new Response(JSON.stringify({
+						ok: false,
+						success: false,
+						error: "Proxy offline (no TCP response)",
+						ping: ping,
+						ms: ping,
+						country: "",
+						countryName: "",
+						loc: ""
+					}), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+
+				let country = "";
+				let countryName = "";
+				try {
+					const geoRes = await fetch("http://ip-api.com/json/" + encodeURIComponent(ip) + "?fields=status,country,countryCode", {
+						headers: { Accept: "application/json" },
+					});
+					if (geoRes.ok) {
+						const geo = await geoRes.json();
+						if (geo && geo.status === "success") {
+							country = String(geo.countryCode || "").toUpperCase();
+							countryName = String(geo.country || "");
+						}
 					}
-				} finally {
-					clearTimeout(timeoutId);
+				} catch (eGeo) {}
+				if (!country) {
 					try {
-						s.close();
-					} catch (e) {}
+						country = (await lookupExitCountry(ip)) || "";
+					} catch (e2) {}
 				}
-				if (!resStr) {
-					throw new Error("Timeout while receiving data");
-				}
-				const ping = Date.now() - startTime;
-				try {
-					const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-					if (jsonMatch && jsonMatch[1]) country = jsonMatch[1];
-				} catch (e) {}
-				if (country === "UN" && ip) {
-					try {
-						const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
-						const geoData = await geoRes.json();
-						if (geoData && geoData.countryCode) country = geoData.countryCode;
-					} catch (e) {}
-				}
-				return new Response(JSON.stringify({ success: true, ok: true, ping, ms: ping, country, loc: country }), { headers: { "Content-Type": "application/json" } });
+
+				const loc = countryName ? (country + " · " + countryName) : (country || "");
+				return new Response(JSON.stringify({
+					ok: true,
+					success: true,
+					ping: ping,
+					ms: ping,
+					country: country,
+					countryName: countryName,
+					loc: loc,
+					ip: ip,
+					port: port
+				}), {
+					headers: { "Content-Type": "application/json" },
+				});
 			} catch (e) {
-				let msg = e.message;
-				if (msg.includes("Stream was cancelled") || msg.includes("network")) msg = "Connection to server lost (proxy may be blocked or offline)";
-				else if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("timeout")) msg = "Connection timeout (proxy unavailable)";
-				else if (msg.includes("Invalid URL") || msg.includes("Invalid format")) msg = "Invalid proxy format";
-				else if (msg === "err") msg = "Unknown error (connection failed)";
-				return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
+				let msg = String(e && e.message || e || "error");
+				if (msg.includes("Stream was cancelled") || msg.includes("network")) msg = "Connection lost (proxy offline)";
+				else if (/timeout|timed out/i.test(msg)) msg = "Connection timeout";
+				else if (/Invalid URL|Invalid format/i.test(msg)) msg = "Invalid proxy format";
+				return new Response(JSON.stringify({ error: msg, ok: false }), {
+					status: 500,
+					headers: { "Content-Type": "application/json" },
+				});
 			}
 		}
+
 		if (url.pathname === "/api/exit-countries" && request.method === "GET") {
 			try {
 				const countries = await buildExitCountries();
@@ -8267,10 +8320,10 @@ function CreateView({
         });
         const j = await res.json().catch(() => ({}));
         const ms = j.ms != null ? j.ms : j.ping;
-        const loc = (j.country || j.loc || j.countryCode || "").toString().toUpperCase();
-        if (res.ok) {
+        const loc = (j.loc || j.countryName || j.country || j.countryCode || "").toString();
+        if (res.ok && j.ok !== false && j.success !== false) {
           setExitStatus((ms != null ? ms + " ms" : "") + (loc ? (ms != null ? " · " : "") + loc : ""));
-          onToast("ms " + (ms != null ? ms : "?") + (loc ? " " + loc : ""), "ping");
+          onToast((ms != null ? ms + " ms" : "ok") + (loc ? " · " + loc : ""), "ping");
         } else {
           setExitStatus("");
           onToast(j.error || "Ping failed", true);
@@ -8309,8 +8362,12 @@ function CreateView({
         if (j && j.proxy) {
           proxyVal = typeof j.proxy === "string" ? j.proxy : (j.proxy.proxy || j.proxy.url || null);
         }
-        if (!res.ok || !proxyVal) {
-          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "No live proxy — try again", true);
+        if (!res.ok) {
+          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "Random failed", true);
+          return;
+        }
+        if (!proxyVal || j.live === false) {
+          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "Offline — next", true);
           return;
         }
         setExitProxy(proxyVal);
@@ -8319,9 +8376,8 @@ function CreateView({
         setExitCountry(loc || "");
         setExitStatus((ms != null ? ms + " ms" : "") + (loc ? (ms != null ? " · " : "") + loc : ""));
         if (mySeq === window.__tbRandSeq) {
-          onToast((ms != null ? ms + " ms" : "OK") + (loc ? " · " + loc : " · ?"), "ping");
-        }
-      } catch (e) {
+          onToast((ms != null ? ms + " ms" : "OK") + (loc ? " · " + loc : ""), "ping");
+        }      } catch (e) {
         if (mySeq === window.__tbRandSeq) onToast("Random failed — try again", true);
       }
     },
