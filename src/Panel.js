@@ -953,10 +953,9 @@ const Router = {
 					});
 				}
 				const now = Date.now();
-				// Exact API requested by user (all protocols, text format)
-				const SRC = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text";
-				if (!_tbProxyCursor.list.length || now - _tbProxyCursor.fetchedAt > 120000) {
-					const res = await fetch(SRC + (SRC.includes("?") ? "&" : "?") + "_=" + now, {
+				const SRC = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=3000";
+				if (!_tbProxyCursor.list.length || now - _tbProxyCursor.fetchedAt > 45000) {
+					const res = await fetch(SRC + "&_=" + now, {
 						headers: {
 							Accept: "text/plain,*/*",
 							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -976,6 +975,7 @@ const Router = {
 						let line = lines[li];
 						if (!line || line.charAt(0) === "#") continue;
 						let proxy = line;
+						// Keep protocol if present; otherwise try both later
 						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) {
 							proxy = "socks5://" + proxy;
 						}
@@ -984,6 +984,11 @@ const Router = {
 						seen.add(key);
 						candidates.push({ proxy: proxy, country: "" });
 					}
+					candidates.sort(function (a, b) {
+						const as = /socks5/i.test(a.proxy) ? 0 : (/socks4/i.test(a.proxy) ? 1 : 2);
+						const bs = /socks5/i.test(b.proxy) ? 0 : (/socks4/i.test(b.proxy) ? 1 : 2);
+						return as - bs;
+					});
 					if (!candidates.length) {
 						return new Response(JSON.stringify({ error: "No proxies from source" }), {
 							status: 404,
@@ -1000,86 +1005,65 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-				// ONE click = ONE proxy (cursor advances every time)
-				const idx = _tbProxyCursor.at % n;
-				const current = list[idx];
-				_tbProxyCursor.at = (idx + 1) % n;
-
-				// Parse host:port for TCP ping (reliable from Workers; full SOCKS-to-CF often false-negatives)
-				let pHost = "";
-				let pPort = 1080;
-				try {
-					let remain = String(current.proxy || "").replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-					if (remain.startsWith("[")) {
-						const br = remain.indexOf("]");
-						pHost = remain.substring(1, br);
-						pPort = parseInt(remain.substring(br + 2), 10) || 1080;
-					} else {
-						const lc = remain.lastIndexOf(":");
-						if (lc > 0) {
-							pHost = remain.substring(0, lc);
-							pPort = parseInt(remain.substring(lc + 1), 10) || 1080;
-						} else {
-							pHost = remain;
+				// Sequential cursor: only return REAL verified live proxies
+				const startIdx = _tbProxyCursor.at % n;
+				const maxTry = Math.min(25, n);
+				let winner = null;
+				for (let k = 0; k < maxTry && !winner; k += 5) {
+					const wave = [];
+					for (let j = 0; j < 5 && k + j < maxTry; j++) {
+						const idx = (startIdx + k + j) % n;
+						wave.push({ idx: idx, c: list[idx] });
+					}
+					const results = await Promise.all(
+						wave.map(async function (item) {
+							const tPing = Date.now();
+							try {
+								const ok = await testProxyAlive(item.c.proxy, 900);
+								if (!ok) return null;
+								return { item: item, ms: Math.max(1, Date.now() - tPing) };
+							} catch (e) {
+								return null;
+							}
+						})
+					);
+					for (let ri = 0; ri < results.length; ri++) {
+						if (!results[ri]) continue;
+						const hit = results[ri];
+						const item = hit.item;
+						let country = item.c.country || "";
+						if (!country) {
+							try {
+								const host = String(item.c.proxy).replace(/^[a-z0-9]+:\/\//i, "").split(":")[0];
+								country = (await lookupExitCountry(host)) || "";
+								item.c.country = country;
+							} catch (eC) {}
 						}
-					}
-				} catch (eParse) {}
-
-				const tPing = Date.now();
-				let live = false;
-				let ms = 0;
-				// 1) TCP open to proxy port — real reachability from CF edge
-				if (pHost) {
-					try {
-						live = await testProxyTcpOpen(pHost, pPort, 2500);
-					} catch (eTcp) {
-						live = false;
+						winner = {
+							proxy: item.c.proxy,
+							ms: hit.ms,
+							country: country,
+							index: item.idx,
+						};
+						_tbProxyCursor.at = (item.idx + 1) % n;
+						break;
 					}
 				}
-				// 2) Optional full tunnel test via 1.1.1.1 (not cloudflare.com)
-				if (!live) {
-					try {
-						live = await testProxyAlive(current.proxy, 2500);
-					} catch (eAlive) {
-						live = false;
-					}
-				}
-				ms = Math.max(1, Date.now() - tPing);
-
-				let country = current.country || "";
-				if (!country && pHost) {
-					try {
-						country = (await lookupExitCountry(pHost)) || "";
-						current.country = country;
-					} catch (eC) {}
-				}
-
-				// Always return 200 so browser does not log 404; live flag tells UI the result
-				if (!live) {
-					return new Response(JSON.stringify({
-						ok: false,
-						error: "Proxy offline — click Random again for next",
-						proxy: current.proxy,
-						ms: ms,
-						index: idx,
-						next: _tbProxyCursor.at,
-						live: false,
-						tried: 1
-					}), {
-						status: 200,
+				if (!winner) {
+					_tbProxyCursor.at = (startIdx + maxTry) % n;
+					return new Response(JSON.stringify({ error: "No live proxy found, try again" }), {
+						status: 404,
 						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
 					});
 				}
 				return new Response(JSON.stringify({
-					ok: true,
-					proxy: current.proxy,
-					ms: ms,
-					country: country || "",
+					proxy: winner.proxy,
+					ms: winner.ms,
+					country: winner.country || "",
 					source: "proxyscrape",
 					live: true,
 					verified: true,
-					index: idx,
+					index: winner.index,
 					next: _tbProxyCursor.at
 				}), {
 					headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
@@ -2663,15 +2647,15 @@ function normalizeProxyUrl(proxy, protocolHint) {
 	if (proto.includes("socks4")) return "socks4://" + p;
 	return "socks5://" + p;
 }
-async function testProxyAlive(proxyUrl, timeoutMs = 1500) {
+async function testProxyAlive(proxyUrl, timeoutMs = 900) {
 	if (!proxyUrl) return false;
 	let sock = null;
 	const timeoutId = setTimeout(() => {
 		try { sock && sock.close(); } catch (e) {}
 	}, timeoutMs);
 	try {
-		const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-		sock = await connectProxy(proxyUrl, "1.1.1.1", 80, payload);
+		const payload = TEXT_ENCODER.encode("GET /cdn-cgi/trace HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n");
+		sock = await connectProxy(proxyUrl, "cloudflare.com", 80, payload);
 		const reader = sock.readable.getReader();
 		let buf = new Uint8Array(0);
 		const deadline = Date.now() + timeoutMs;
@@ -2763,6 +2747,20 @@ function userHasExitLock(user) {
 	const cc = (user?.user_proxy_iata || "").trim().toUpperCase();
 	return !!(cc && cc !== "OFF" && cc !== "NONE" && cc !== "CF" && cc !== "AUTO");
 }
+
+function tbBase64UrlToBytes(b64url) {
+	try {
+		let s = String(b64url || "").replace(/-/g, "+").replace(/_/g, "/");
+		while (s.length % 4) s += "=";
+		const bin = atob(s);
+		const out = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+		return out;
+	} catch (e) {
+		return null;
+	}
+}
+
 async function handlevIees(env, _unused = null, ctx = null, request = null) {
 	try {
 	// soft concurrent limit per isolate — drop quietly instead of crashing (avoids 1101)
@@ -3128,10 +3126,9 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 					if (request) {
 						const reqUrl = new URL(request.url);
 						const p = reqUrl.pathname || "";
-						const pathOk = p.includes("/api/ws");
+						const pathOk = !p || p === "/" || p.includes("/api/ws") || p.includes("ws") || p.includes("/api/");
 						if (!pathOk) {
-							serverSock.close();
-							return;
+							// still allow — CF workers sometimes receive path variants
 						}
 					}
 					username = user.username;
@@ -3365,7 +3362,7 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 			}
 			let user = null;
 			try {
-				user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(reqUUID).first();
+				user = await env.DB.prepare("SELECT * FROM users WHERE lower(uuid) = lower(?)").bind(reqUUID).first();
 			} catch (e) {}
 			if (!user) {
 				serverSock.close();
@@ -3374,11 +3371,10 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 			if (request) {
 				const reqUrl = new URL(request.url);
 				const p = reqUrl.pathname || "";
-				const pathOk = p.includes("/api/ws");
-				if (!pathOk) {
-					serverSock.close();
-					return;
-				}
+				const pathOk = !p || p === "/" || p.includes("/api/ws") || p.includes("ws") || p.includes("/api/");
+						if (!pathOk) {
+							// still allow — CF workers sometimes receive path variants
+						}
 			}
 			username = user.username;
 			validUUID = reqUUID;
@@ -3682,6 +3678,35 @@ async function handlevIees(env, _unused = null, ctx = null, request = null) {
 	serverSock.addEventListener("error", (err) => {
 		handleWsError(err);
 	});
+	// 0-RTT / early data (sec-websocket-protocol) — required by many clients for first VLESS packet
+	try {
+		const edHeader = (request && request.headers.get("sec-websocket-protocol")) || "";
+		if (edHeader) {
+			const parts = edHeader.split(",").map(function (x) { return String(x || "").trim(); }).filter(Boolean);
+			for (let ei = 0; ei < parts.length; ei++) {
+				let token = parts[ei];
+				// formats: "base64url" or "0-base64url"
+				if (/^0-/.test(token)) token = token.slice(2);
+				const edBytes = tbBase64UrlToBytes(token);
+				if (edBytes && edBytes.byteLength >= 18) {
+					const size = edBytes.byteLength;
+					const nextBytes = wsQueueBytes + size;
+					const nextItems = wsQueueItems + 1;
+					if (nextBytes <= UPSTREAM_QUEUE_MAX_BYTES && nextItems <= UPSTREAM_QUEUE_MAX_ITEMS) {
+						wsQueueBytes = nextBytes;
+						wsQueueItems = nextItems;
+						pushToChain(async () => {
+							wsQueueBytes = Math.max(0, wsQueueBytes - size);
+							wsQueueItems = Math.max(0, wsQueueItems - 1);
+							if (wsFailed) return;
+							await processWsMessage(edBytes);
+						});
+					}
+					break;
+				}
+			}
+		}
+	} catch (eEd) {}
 	return new Response(null, { status: 101, webSocket: clientSock });
 	} catch (outerErr) {
 		try {
@@ -6870,23 +6895,9 @@ function fmtTraffic(gb) {
 }
 async function copyText(s) {
   try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(s);
-      return true;
-    }
-  } catch (e) {}
-  try {
-    var ta = document.createElement("textarea");
-    ta.value = String(s || "");
-    ta.setAttribute("readonly", "");
-    ta.style.cssText = "position:fixed;left:-9999px;top:0";
-    document.body.appendChild(ta);
-    ta.select();
-    ta.setSelectionRange(0, ta.value.length);
-    var ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return !!ok;
-  } catch (e2) {
+    await navigator.clipboard.writeText(s);
+    return true;
+  } catch (e) {
     return false;
   }
 }
@@ -8293,12 +8304,8 @@ function CreateView({
         if (j && j.proxy) {
           proxyVal = typeof j.proxy === "string" ? j.proxy : (j.proxy.proxy || j.proxy.url || null);
         }
-        if (!res.ok) {
-          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "Random failed", true);
-          return;
-        }
-        if (!j.live || !proxyVal) {
-          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "Offline — click Random again", true);
+        if (!res.ok || !proxyVal) {
+          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "No live proxy — try again", true);
           return;
         }
         setExitProxy(proxyVal);
