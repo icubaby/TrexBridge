@@ -772,9 +772,9 @@ const Router = {
 			const wantsHtml = !raw && !isClient && (accept.includes("text/html") || ua.includes("mozilla") || ua.includes("chrome") || ua.includes("safari") || !ua);
 			if (wantsHtml) {
 				// Same UI as /profile status page — server builds links WITH fragment
-				const configLinks = configLinks(user, host) || [];
+				const builtLinks = configLinks(user, host) || [];
 				const userJson = JSON.stringify({
-					config_links: configLinks,
+					config_links: builtLinks,
 					username: user.username,
 					uuid: user.uuid,
 					limit_gb: user.limit_gb,
@@ -851,9 +851,9 @@ const Router = {
 				return new Response("User not found", { status: 404 });
 			}
 			const host = url.hostname;
-			const configLinks = configLinks(user, host) || [];
+			const builtLinks = configLinks(user, host) || [];
 			const userJson = JSON.stringify({
-				config_links: configLinks,
+				config_links: builtLinks,
 				username: user.username,
 				uuid: user.uuid,
 				limit_gb: user.limit_gb,
