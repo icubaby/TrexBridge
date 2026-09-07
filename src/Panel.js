@@ -998,8 +998,7 @@ const Router = {
 				const now = Date.now();
 				const SRC =
 					"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
-				// Refresh list at most every 3 minutes — no background testing
-				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 180000) {
+				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 120000) {
 					const res = await fetch(SRC + (SRC.includes("?") ? "&" : "?") + "_=" + now, {
 						headers: {
 							Accept: "application/json,*/*",
@@ -1031,6 +1030,7 @@ const Router = {
 					for (let li = 0; li < arr.length; li++) {
 						const row = arr[li];
 						if (!row || typeof row !== "object") continue;
+						// Prefer API-marked alive; skip known dead when field exists
 						if (row.alive === false) continue;
 						let proxy = String(row.proxy || "").trim();
 						if (!proxy) {
@@ -1042,8 +1042,7 @@ const Router = {
 						if (!proxy) continue;
 						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) {
 							const proto = String(row.protocol || "socks5").toLowerCase();
-							proxy =
-								(/^socks5|socks4|http|https$/i.test(proto) ? proto : "socks5") + "://" + proxy;
+							proxy = (/^socks5|socks4|http|https$/i.test(proto) ? proto : "socks5") + "://" + proxy;
 						}
 						const key = proxy.toLowerCase();
 						if (seen.has(key)) continue;
@@ -1055,21 +1054,35 @@ const Router = {
 							.trim()
 							.toUpperCase();
 						const city = String(ipData.city || row.city || "").trim();
+						const apiTimeout =
+							typeof row.timeout === "number"
+								? Math.round(row.timeout)
+								: typeof row.average_timeout === "number"
+									? Math.round(row.average_timeout)
+									: null;
 						candidates.push({
 							proxy: proxy,
 							country: country,
 							city: city,
 							protocol: String(row.protocol || "").toLowerCase(),
+							alive: row.alive === true,
+							apiTimeout: apiTimeout,
+							uptime: typeof row.uptime === "number" ? row.uptime : null,
 						});
 					}
-					// Prefer socks5 first, keep relative order
+					// Prefer socks5, then socks4, then http — keep relative order within group
 					candidates.sort(function (a, b) {
 						const rank = function (p) {
 							if (/socks5/i.test(p.protocol || p.proxy)) return 0;
 							if (/socks4/i.test(p.protocol || p.proxy)) return 1;
 							return 2;
 						};
-						return rank(a) - rank(b);
+						const ra = rank(a);
+						const rb = rank(b);
+						if (ra !== rb) return ra - rb;
+						// alive true first
+						if (a.alive !== b.alive) return a.alive ? -1 : 1;
+						return 0;
 					});
 					if (!candidates.length) {
 						return new Response(JSON.stringify({ error: "No proxies from source" }), {
@@ -1087,66 +1100,68 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-				// ONE proxy per click only — no multi-try loop (saves CPU, avoids 1101)
-				const idx = ((state.proxyCursor.at % n) + n) % n;
-				const cand = list[idx];
-				state.proxyCursor.at = (idx + 1) % n;
-				if (!cand || !cand.proxy) {
-					return new Response(JSON.stringify({ error: "No proxy at this index, try again" }), {
+				const startIdx = ((state.proxyCursor.at % n) + n) % n;
+				const maxTry = Math.min(40, n);
+				let winner = null;
+				for (let k = 0; k < maxTry; k++) {
+					const idx = (startIdx + k) % n;
+					const cand = list[idx];
+					if (!cand || !cand.proxy) continue;
+					const t0 = Date.now();
+					let live = false;
+					try {
+						live = await isProxyLive(cand.proxy, 2500);
+					} catch (ePing) {
+						live = false;
+					}
+					const ms = Math.max(1, Date.now() - t0);
+					if (!live) {
+						state.proxyCursor.at = (idx + 1) % n;
+						continue;
+					}
+					let country = cand.country || "";
+					if (!country) {
+						try {
+							const host = String(cand.proxy)
+								.replace(/^[a-z0-9]+:\/\//i, "")
+								.replace(/^.*@/, "")
+								.split(":")[0];
+							country = (await lookupExitCountry(host)) || "";
+							cand.country = country;
+						} catch (eC) {}
+					}
+					winner = {
+						proxy: cand.proxy,
+						ms: ms,
+						country: country,
+						city: cand.city || "",
+						protocol: cand.protocol || "",
+						apiTimeout: cand.apiTimeout,
+						uptime: cand.uptime,
+						index: idx,
+					};
+					state.proxyCursor.at = (idx + 1) % n;
+					break;
+				}
+				if (!winner) {
+					return new Response(JSON.stringify({ error: "No live proxy found, try again" }), {
 						status: 404,
 						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
 					});
 				}
-				const t0 = Date.now();
-				let live = false;
-				try {
-					live = await isProxyLive(cand.proxy, 1800);
-				} catch (ePing) {
-					live = false;
-				}
-				const ms = Math.max(1, Date.now() - t0);
-				if (!live) {
-					return new Response(
-						JSON.stringify({
-							error: "This proxy has no ping — press Random again for the next one",
-							live: false,
-							proxy: cand.proxy,
-							ms: ms,
-							country: cand.country || "",
-							city: cand.city || "",
-							index: idx,
-							next: state.proxyCursor.at,
-							total: n,
-							source: "proxyscrape-json",
-						}),
-						{
-							status: 404,
-							headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
-						}
-					);
-				}
-				let country = cand.country || "";
-				if (!country) {
-					try {
-						const host = String(cand.proxy)
-							.replace(/^[a-z0-9]+:\/\//i, "")
-							.replace(/^.*@/, "")
-							.split(":")[0];
-						country = (await lookupExitCountry(host)) || "";
-						cand.country = country;
-					} catch (eC) {}
-				}
 				return new Response(
 					JSON.stringify({
-						proxy: cand.proxy,
-						ms: ms,
-						country: country || "",
-						city: cand.city || "",
-						protocol: cand.protocol || "",
+						proxy: winner.proxy,
+						ms: winner.ms,
+						country: winner.country || "",
+						city: winner.city || "",
+						protocol: winner.protocol || "",
+						apiTimeout: winner.apiTimeout,
+						uptime: winner.uptime,
 						source: "proxyscrape-json",
 						live: true,
 						verified: true,
-						index: idx,
+						index: winner.index,
 						next: state.proxyCursor.at,
 						total: n,
 					}),
@@ -8348,8 +8363,8 @@ function CreateView({
         if (j && j.proxy) {
           proxyVal = typeof j.proxy === "string" ? j.proxy : (j.proxy.proxy || j.proxy.url || null);
         }
-        if (!res.ok || !proxyVal || j.live === false) {
-          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "No ping — press Random again", true);
+        if (!res.ok || !proxyVal) {
+          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "No live proxy — try again", true);
           return;
         }
         setExitProxy(proxyVal);
