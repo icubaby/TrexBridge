@@ -996,9 +996,135 @@ const Router = {
 					});
 				}
 				const now = Date.now();
+				const countryQ = String(url.searchParams.get("country") || "")
+					.trim()
+					.toLowerCase();
+				const wantCountry = countryQ && countryQ !== "all" ? countryQ.slice(0, 2) : "";
+
+				// Country mode: 1 ProxyScrape fetch + at most 2 real pings (low CPU)
+				if (wantCountry) {
+					const SRC =
+						"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&country=" +
+						encodeURIComponent(wantCountry) +
+						"&limit=20&timeout=3000";
+					const res = await fetch(SRC + "&_=" + now, {
+						headers: {
+							Accept: "application/json,*/*",
+							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+						},
+					});
+					if (!res.ok) {
+						return new Response(JSON.stringify({ error: "Proxy source error", status: res.status }), {
+							status: 502,
+							headers: { "Content-Type": "application/json; charset=utf-8" },
+						});
+					}
+					let data = null;
+					try {
+						data = await res.json();
+					} catch (eJ) {
+						return new Response(JSON.stringify({ error: "Proxy JSON parse failed" }), {
+							status: 502,
+							headers: { "Content-Type": "application/json; charset=utf-8" },
+						});
+					}
+					const arr = Array.isArray(data)
+						? data
+						: Array.isArray(data && data.proxies)
+							? data.proxies
+							: [];
+					const pool = [];
+					const seen = new Set();
+					for (let li = 0; li < arr.length; li++) {
+						const row = arr[li];
+						if (!row || typeof row !== "object") continue;
+						if (row.alive === false) continue;
+						let proxy = String(row.proxy || "").trim();
+						if (!proxy) {
+							const ip = row.ip || row.host;
+							const port = row.port;
+							if (ip && port) proxy = "socks5://" + ip + ":" + port;
+						}
+						if (!proxy) continue;
+						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) proxy = "socks5://" + proxy;
+						const key = proxy.toLowerCase();
+						if (seen.has(key)) continue;
+						seen.add(key);
+						const ipData = row.ip_data && typeof row.ip_data === "object" ? row.ip_data : {};
+						const cc = String(
+							ipData.countryCode || ipData.country_code || row.countryCode || wantCountry || ""
+						)
+							.trim()
+							.toUpperCase();
+						const city = String(ipData.city || row.city || "").trim();
+						const apiTo =
+							typeof row.timeout === "number"
+								? row.timeout
+								: typeof row.average_timeout === "number"
+									? row.average_timeout
+									: 99999;
+						pool.push({ proxy, country: cc, city, apiTo });
+					}
+					pool.sort(function (a, b) {
+						return a.apiTo - b.apiTo;
+					});
+					// Real ping: max 2 candidates only
+					const tryN = Math.min(2, pool.length);
+					let best = null;
+					for (let ti = 0; ti < tryN; ti++) {
+						const cand = pool[ti];
+						const t0 = Date.now();
+						let live = false;
+						try {
+							live = await isProxyLive(cand.proxy, 1600);
+						} catch (eP) {
+							live = false;
+						}
+						const ms = Math.max(1, Date.now() - t0);
+						if (!live) continue;
+						if (!best || ms < best.ms) {
+							best = {
+								proxy: cand.proxy,
+								ms: ms,
+								country: cand.country || wantCountry.toUpperCase(),
+								city: cand.city || "",
+							};
+						}
+						// if first is good enough (<800ms) stop early — save CPU
+						if (best && best.ms < 800) break;
+					}
+					if (!best) {
+						return new Response(
+							JSON.stringify({
+								error: "No live proxy in " + wantCountry.toUpperCase() + " — try another country",
+								live: false,
+								country: wantCountry.toUpperCase(),
+							}),
+							{
+								status: 404,
+								headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+							}
+						);
+					}
+					return new Response(
+						JSON.stringify({
+							proxy: best.proxy,
+							ms: best.ms,
+							country: best.country || "",
+							city: best.city || "",
+							source: "proxyscrape-country",
+							live: true,
+							verified: true,
+						}),
+						{
+							headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+						}
+					);
+				}
+
+				// Random mode: ONE proxy per click from cached global list
 				const SRC =
-					"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
-				// Refresh list at most every 3 minutes — no background testing
+					"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&limit=100";
 				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 180000) {
 					const res = await fetch(SRC + (SRC.includes("?") ? "&" : "?") + "_=" + now, {
 						headers: {
@@ -1036,15 +1162,10 @@ const Router = {
 						if (!proxy) {
 							const ip = row.ip || row.host;
 							const port = row.port;
-							const proto = String(row.protocol || "socks5").toLowerCase();
-							if (ip && port) proxy = proto + "://" + ip + ":" + port;
+							if (ip && port) proxy = "socks5://" + ip + ":" + port;
 						}
 						if (!proxy) continue;
-						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) {
-							const proto = String(row.protocol || "socks5").toLowerCase();
-							proxy =
-								(/^socks5|socks4|http|https$/i.test(proto) ? proto : "socks5") + "://" + proxy;
-						}
+						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) proxy = "socks5://" + proxy;
 						const key = proxy.toLowerCase();
 						if (seen.has(key)) continue;
 						seen.add(key);
@@ -1055,22 +1176,8 @@ const Router = {
 							.trim()
 							.toUpperCase();
 						const city = String(ipData.city || row.city || "").trim();
-						candidates.push({
-							proxy: proxy,
-							country: country,
-							city: city,
-							protocol: String(row.protocol || "").toLowerCase(),
-						});
+						candidates.push({ proxy, country, city });
 					}
-					// Prefer socks5 first, keep relative order
-					candidates.sort(function (a, b) {
-						const rank = function (p) {
-							if (/socks5/i.test(p.protocol || p.proxy)) return 0;
-							if (/socks4/i.test(p.protocol || p.proxy)) return 1;
-							return 2;
-						};
-						return rank(a) - rank(b);
-					});
 					if (!candidates.length) {
 						return new Response(JSON.stringify({ error: "No proxies from source" }), {
 							status: 404,
@@ -1087,7 +1194,6 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-				// ONE proxy per click only — no multi-try loop (saves CPU, avoids 1101)
 				const idx = ((state.proxyCursor.at % n) + n) % n;
 				const cand = list[idx];
 				state.proxyCursor.at = (idx + 1) % n;
@@ -1100,7 +1206,7 @@ const Router = {
 				const t0 = Date.now();
 				let live = false;
 				try {
-					live = await isProxyLive(cand.proxy, 1800);
+					live = await isProxyLive(cand.proxy, 1600);
 				} catch (ePing) {
 					live = false;
 				}
@@ -1125,24 +1231,12 @@ const Router = {
 						}
 					);
 				}
-				let country = cand.country || "";
-				if (!country) {
-					try {
-						const host = String(cand.proxy)
-							.replace(/^[a-z0-9]+:\/\//i, "")
-							.replace(/^.*@/, "")
-							.split(":")[0];
-						country = (await lookupExitCountry(host)) || "";
-						cand.country = country;
-					} catch (eC) {}
-				}
 				return new Response(
 					JSON.stringify({
 						proxy: cand.proxy,
 						ms: ms,
-						country: country || "",
+						country: cand.country || "",
 						city: cand.city || "",
-						protocol: cand.protocol || "",
 						source: "proxyscrape-json",
 						live: true,
 						verified: true,
@@ -7538,6 +7632,8 @@ function CreateView({
   const [exitProxy, setExitProxy] = useState("");
   const [exitCountry, setExitCountry] = useState("");
   const [exitStatus, setExitStatus] = useState("");
+  const [exitBusy, setExitBusy] = useState(false);
+  const [showExitLoc, setShowExitLoc] = useState(false);
   const [ipLoading, setIpLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   useEffect(() => {
@@ -8291,10 +8387,13 @@ function CreateView({
       setExitProxy(e.target.value);
       setExitStatus("");
     }
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "flex gap-2"
+  }), exitStatus ? /*#__PURE__*/React.createElement("div", {
+    className: "text-xs font-extrabold border-[2.5px] border-black px-2 py-1 shadow-[2px_2px_0_#000] bg-[#bbf7d0]"
+  }, exitStatus) : null, /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 flex-wrap"
   }, /*#__PURE__*/React.createElement("button", {
     type: "button",
+    disabled: exitBusy,
     onClick: async () => {
       if (!exitProxy) return onToast("No proxy", true);
       try {
@@ -8319,12 +8418,14 @@ function CreateView({
       }
     },
     className: "chip-pick flex-1",
-    style: { background: "#7dd3fc", color: "#000" }
+    style: { background: "#7dd3fc", color: "#000", opacity: exitBusy ? 0.5 : 1 }
   }, "Test"), /*#__PURE__*/React.createElement("button", {
     type: "button",
+    disabled: exitBusy,
     onClick: () => {
       if (!exitProxy.trim()) {
         setExitProxy("");
+        setExitCountry("");
         setExitStatus("");
         onToast("Cleared");
         return;
@@ -8332,12 +8433,21 @@ function CreateView({
       onToast("Applied", "success");
     },
     className: "chip-pick flex-1",
-    style: { background: "#facc15", color: "#000" }
+    style: { background: "#facc15", color: "#000", opacity: exitBusy ? 0.5 : 1 }
   }, "Apply"), /*#__PURE__*/React.createElement("button", {
     type: "button",
+    disabled: exitBusy,
+    onClick: () => setShowExitLoc(v => !v),
+    className: "chip-pick flex-1",
+    style: { background: showExitLoc ? "#f9a8d4" : "#86efac", color: "#000", opacity: exitBusy ? 0.5 : 1 }
+  }, "Location"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: exitBusy,
     onClick: async () => {
+      if (exitBusy) return;
       window.__tbRandSeq = (window.__tbRandSeq || 0) + 1;
       const mySeq = window.__tbRandSeq;
+      setExitBusy(true);
       onToast("Picking…", "ping");
       try {
         const res = await fetch("/api/random-proxy?t=" + Date.now() + "&r=" + Math.random().toString(36).slice(2), { credentials: "same-origin", cache: "no-store" });
@@ -8364,11 +8474,71 @@ function CreateView({
         }
       } catch (e) {
         if (mySeq === window.__tbRandSeq) onToast("Random failed — try again", true);
+      } finally {
+        if (mySeq === window.__tbRandSeq) setExitBusy(false);
       }
     },
     className: "chip-pick flex-1",
-    style: { background: "#a78bfa", color: "#000" }
-  }, "Random")))), /*#__PURE__*/React.createElement(StarDiv, null), /*#__PURE__*/React.createElement("div", {
+    style: { background: "#a78bfa", color: "#000", opacity: exitBusy ? 0.5 : 1 }
+  }, exitBusy ? "…" : "Random")), showExitLoc ? /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-1.5"
+  }, [
+    { code: "US", label: "USA", bg: "#93c5fd" },
+    { code: "DE", label: "Germany", bg: "#fde68a" },
+    { code: "NL", label: "Netherlands", bg: "#f9a8d4" },
+    { code: "GB", label: "UK", bg: "#a7f3d0" },
+    { code: "FR", label: "France", bg: "#c4b5fd" },
+    { code: "TR", label: "Turkey", bg: "#fdba74" },
+    { code: "CA", label: "Canada", bg: "#7dd3fc" },
+    { code: "FI", label: "Finland", bg: "#fca5a5" },
+    { code: "PL", label: "Poland", bg: "#bef264" },
+    { code: "JP", label: "Japan", bg: "#fbcfe8" },
+    { code: "SG", label: "Singapore", bg: "#a5b4fc" },
+    { code: "IT", label: "Italy", bg: "#fcd34d" }
+  ].map(function (c) {
+    return /*#__PURE__*/React.createElement("button", {
+      key: c.code,
+      type: "button",
+      disabled: exitBusy,
+      onClick: async function () {
+        if (exitBusy) return;
+        window.__tbRandSeq = (window.__tbRandSeq || 0) + 1;
+        const mySeq = window.__tbRandSeq;
+        setExitBusy(true);
+        onToast("Finding " + c.code + "…", "ping");
+        try {
+          const res = await fetch("/api/random-proxy?country=" + encodeURIComponent(c.code) + "&t=" + Date.now(), { credentials: "same-origin", cache: "no-store" });
+          if (mySeq !== window.__tbRandSeq) return;
+          const j = await res.json().catch(function () { return {}; });
+          if (mySeq !== window.__tbRandSeq) return;
+          let proxyVal = null;
+          if (j && j.proxy) {
+            proxyVal = typeof j.proxy === "string" ? j.proxy : (j.proxy.proxy || j.proxy.url || null);
+          }
+          if (!res.ok || !proxyVal || j.live === false) {
+            if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || ("No live proxy in " + c.code), true);
+            return;
+          }
+          setExitProxy(proxyVal);
+          const ms = j.ms != null ? j.ms : null;
+          const loc = (j.country || c.code || "").toString().toUpperCase();
+          const city = (j.city || "").toString();
+          setExitCountry(loc || "");
+          const locLabel = loc ? (city ? loc + "/" + city : loc) : "";
+          setExitStatus((ms != null ? ms + " ms" : "") + (locLabel ? (ms != null ? " · " : "") + locLabel : ""));
+          if (mySeq === window.__tbRandSeq) {
+            onToast((ms != null ? ms + " ms" : "OK") + (locLabel ? " · " + locLabel : ""), "ping");
+          }
+        } catch (e) {
+          if (mySeq === window.__tbRandSeq) onToast("Location pick failed", true);
+        } finally {
+          if (mySeq === window.__tbRandSeq) setExitBusy(false);
+        }
+      },
+      className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+      style: { background: c.bg, color: "#000", opacity: exitBusy ? 0.45 : 1 }
+    }, c.label);
+  })) : null), /*#__PURE__*/React.createElement(StarDiv, null), /*#__PURE__*/React.createElement("div", {
     className: "nb-card"
   }, /*#__PURE__*/React.createElement(Head, {
     icon: "dns",
