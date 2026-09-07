@@ -8675,7 +8675,7 @@ function CreateView({
     disabled: ipLoading,
     onClick: applyIps,
     className: "w-full min-h-[48px] bg-[#7c3aed] text-white border-[2.5px] border-black shadow-[4px_4px_0_#000] font-black text-sm disabled:opacity-60"
-  }, ipLoading ? "Loading…" : "Apply IPs")))));
+  }, ipLoading ? "Loading…" : "Apply IPs"))))));
 }
 function SettingsView({
   onToast
