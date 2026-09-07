@@ -29,6 +29,8 @@ const TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
 const FLUX_QUERY =
   "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") +
   "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
+const FLUX_QUERY_SAFE =
+  "&fragment=" + encodeURIComponent("tlshello,5,94,1,0");
 const DEFAULT_FRAG_QUERY =
   "&fragment=" + encodeURIComponent("tlshello,100-200,1-1,100-200");
 const FLUX_JSON = JSON.stringify({
@@ -190,6 +192,7 @@ function fragOptions(user) {
   } catch (e) {}
   return {
     query: useFlux ? FLUX_QUERY : DEFAULT_FRAG_QUERY,
+    querySafe: useFlux ? FLUX_QUERY_SAFE : DEFAULT_FRAG_QUERY,
     protos,
     flux: useFlux,
   };
@@ -201,7 +204,7 @@ function configLinks(user, host) {
   const fp = (user && user.fingerprint) || "chrome";
   const path = encodeURIComponent("/api/ws");
   const frag = fragOptions(user);
-  const userFrag = frag && frag.flux === false ? DEFAULT_FRAG_QUERY : FLUX_QUERY;
+  const userFrag = frag && frag.flux === false ? DEFAULT_FRAG_QUERY : FLUX_QUERY_SAFE;
   const protos = frag.protos && frag.protos.length ? frag.protos : ["vless"];
   const uuid = (user && user.uuid) || "";
   const links = [];
@@ -7195,7 +7198,7 @@ function TrexBridgePanel() {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   credentials: "same-origin",
-                  body: JSON.stringify({ username: uname, limit_gb: null, expiry_days: null, ips: ipsStr, port: "443", tls: "on", fingerprint: "ios", block_ads: 1, frag_len: JSON.stringify(fragBase), frag_int: "0", ip_count: 10, ip_operator: "all", user_socks5: null, auto_rotate_user_proxy: 0 })
+                  body: JSON.stringify({ username: uname, limit_gb: null, expiry_days: null, ips: ipsStr, port: "443,80", tls: "on", fingerprint: "ios", block_ads: 1, frag_len: JSON.stringify(fragBase), frag_int: "0", ip_count: 5, ip_operator: "all", user_socks5: null, auto_rotate_user_proxy: 0 })
                 });
                 var j = await res.json().catch(function () { return {}; });
                 if (!res.ok) throw new Error(j.error || "Create failed");
@@ -7664,7 +7667,7 @@ function CreateView({
         limit_req: null,
         ip_limit: null,
         ips: ipsStr,
-        port: "443",
+        port: "443,80",
         tls: "on",
         fingerprint: "ios",
         block_porn: 0,
@@ -7673,7 +7676,7 @@ function CreateView({
         frag_int: "0",
         auto_reset_vol_days: 0,
         auto_reset_req_days: 0,
-        ip_count: 10,
+        ip_count: 5,
         ip_operator: "all",
         user_socks5: null,
         auto_rotate_user_proxy: 0
@@ -9336,7 +9339,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
   var fp = u.fingerprint || "chrome";
   var rawPath = "/api/ws";
   var fProtos = ["vless"];
-  var fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") + "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
+  var fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0");
   try {
     var _raw = u.frag_len ? String(u.frag_len) : "";
     if (_raw) {
@@ -9344,7 +9347,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
         fragQ = "&fragment=" + encodeURIComponent("tlshello,100-200,1-1,100-200");
       }
       if (_raw.indexOf("trex") >= 0 || _raw.indexOf("flux") >= 0 || _raw.indexOf("packets2") >= 0 || _raw.indexOf("5,94,1") >= 0 || _raw.indexOf("dual") >= 0) {
-        fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") + "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
+        fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0");
       }
       if (_raw.charAt(0) === "{") {
         var _fj = JSON.parse(_raw);
@@ -9357,7 +9360,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
         if (_m === "default" || _m === "normal") {
           fragQ = "&fragment=" + encodeURIComponent("tlshello,100-200,1-1,100-200");
         } else if (_m === "trex" || _m === "flux" || _fj.dual || _fj.packets2) {
-          fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") + "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
+          fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0");
         }
       }
     }
@@ -9387,7 +9390,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
     return "🦖 - " + boldSans("TrexBridge") + "-" + boldSans(namePart);
   }
   if (!fragQ || fragQ.indexOf("fragment=") < 0) {
-    fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") + "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
+    fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0");
   }
   ips.forEach(function(ip) {
     ports.forEach(function(portStr) {
