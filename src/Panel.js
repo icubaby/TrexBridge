@@ -58,7 +58,7 @@ const CLEAN_IP_URL =
 const REPO_BASE =
   "https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main";
 const PROXY_LIST_URL =
-  "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=3000";
+  "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
 
 function isFluxFrag(userOrFrag) {
   try {
@@ -993,11 +993,12 @@ const Router = {
 					});
 				}
 				const now = Date.now();
-				const SRC = "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=3000";
-				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 45000) {
-					const res = await fetch(SRC + "&_=" + now, {
+				const SRC =
+					"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
+				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 120000) {
+					const res = await fetch(SRC + (SRC.includes("?") ? "&" : "?") + "_=" + now, {
 						headers: {
-							Accept: "text/plain,*/*",
+							Accept: "application/json,*/*",
 							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
 						},
 					});
@@ -1007,27 +1008,78 @@ const Router = {
 							headers: { "Content-Type": "application/json; charset=utf-8" },
 						});
 					}
-					const text = await res.text();
-					const lines = String(text || "").split(/\r?\n/).map(function (l) { return l.trim(); }).filter(Boolean);
+					let data = null;
+					try {
+						data = await res.json();
+					} catch (eJ) {
+						return new Response(JSON.stringify({ error: "Proxy JSON parse failed" }), {
+							status: 502,
+							headers: { "Content-Type": "application/json; charset=utf-8" },
+						});
+					}
+					const arr = Array.isArray(data)
+						? data
+						: Array.isArray(data && data.proxies)
+							? data.proxies
+							: [];
 					const candidates = [];
 					const seen = new Set();
-					for (let li = 0; li < lines.length; li++) {
-						let line = lines[li];
-						if (!line || line.charAt(0) === "#") continue;
-						let proxy = line;
-						// Keep protocol if present; otherwise try both later
+					for (let li = 0; li < arr.length; li++) {
+						const row = arr[li];
+						if (!row || typeof row !== "object") continue;
+						// Prefer API-marked alive; skip known dead when field exists
+						if (row.alive === false) continue;
+						let proxy = String(row.proxy || "").trim();
+						if (!proxy) {
+							const ip = row.ip || row.host;
+							const port = row.port;
+							const proto = String(row.protocol || "socks5").toLowerCase();
+							if (ip && port) proxy = proto + "://" + ip + ":" + port;
+						}
+						if (!proxy) continue;
 						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) {
-							proxy = "socks5://" + proxy;
+							const proto = String(row.protocol || "socks5").toLowerCase();
+							proxy = (/^socks5|socks4|http|https$/i.test(proto) ? proto : "socks5") + "://" + proxy;
 						}
 						const key = proxy.toLowerCase();
 						if (seen.has(key)) continue;
 						seen.add(key);
-						candidates.push({ proxy: proxy, country: "" });
+						const ipData = row.ip_data && typeof row.ip_data === "object" ? row.ip_data : {};
+						const country = String(
+							ipData.countryCode || ipData.country_code || row.countryCode || row.country || ""
+						)
+							.trim()
+							.toUpperCase();
+						const city = String(ipData.city || row.city || "").trim();
+						const apiTimeout =
+							typeof row.timeout === "number"
+								? Math.round(row.timeout)
+								: typeof row.average_timeout === "number"
+									? Math.round(row.average_timeout)
+									: null;
+						candidates.push({
+							proxy: proxy,
+							country: country,
+							city: city,
+							protocol: String(row.protocol || "").toLowerCase(),
+							alive: row.alive === true,
+							apiTimeout: apiTimeout,
+							uptime: typeof row.uptime === "number" ? row.uptime : null,
+						});
 					}
+					// Prefer socks5, then socks4, then http — keep relative order within group
 					candidates.sort(function (a, b) {
-						const as = /socks5/i.test(a.proxy) ? 0 : (/socks4/i.test(a.proxy) ? 1 : 2);
-						const bs = /socks5/i.test(b.proxy) ? 0 : (/socks4/i.test(b.proxy) ? 1 : 2);
-						return as - bs;
+						const rank = function (p) {
+							if (/socks5/i.test(p.protocol || p.proxy)) return 0;
+							if (/socks4/i.test(p.protocol || p.proxy)) return 1;
+							return 2;
+						};
+						const ra = rank(a);
+						const rb = rank(b);
+						if (ra !== rb) return ra - rb;
+						// alive true first
+						if (a.alive !== b.alive) return a.alive ? -1 : 1;
+						return 0;
 					});
 					if (!candidates.length) {
 						return new Response(JSON.stringify({ error: "No proxies from source" }), {
@@ -1045,71 +1097,77 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-				// Sequential cursor: only return REAL verified live proxies
-				const startIdx = state.proxyCursor.at % n;
-				const maxTry = Math.min(25, n);
+				const startIdx = ((state.proxyCursor.at % n) + n) % n;
+				const maxTry = Math.min(40, n);
 				let winner = null;
-				for (let k = 0; k < maxTry && !winner; k += 5) {
-					const wave = [];
-					for (let j = 0; j < 5 && k + j < maxTry; j++) {
-						const idx = (startIdx + k + j) % n;
-						wave.push({ idx: idx, c: list[idx] });
+				for (let k = 0; k < maxTry; k++) {
+					const idx = (startIdx + k) % n;
+					const cand = list[idx];
+					if (!cand || !cand.proxy) continue;
+					const t0 = Date.now();
+					let live = false;
+					try {
+						live = await isProxyLive(cand.proxy, 2500);
+					} catch (ePing) {
+						live = false;
 					}
-					const results = await Promise.all(
-						wave.map(async function (item) {
-							const tPing = Date.now();
-							try {
-								const ok = await isProxyLive(item.c.proxy, 900);
-								if (!ok) return null;
-								return { item: item, ms: Math.max(1, Date.now() - tPing) };
-							} catch (e) {
-								return null;
-							}
-						})
-					);
-					for (let ri = 0; ri < results.length; ri++) {
-						if (!results[ri]) continue;
-						const hit = results[ri];
-						const item = hit.item;
-						let country = item.c.country || "";
-						if (!country) {
-							try {
-								const host = String(item.c.proxy).replace(/^[a-z0-9]+:\/\//i, "").split(":")[0];
-								country = (await lookupExitCountry(host)) || "";
-								item.c.country = country;
-							} catch (eC) {}
-						}
-						winner = {
-							proxy: item.c.proxy,
-							ms: hit.ms,
-							country: country,
-							index: item.idx,
-						};
-						state.proxyCursor.at = (item.idx + 1) % n;
-						break;
+					const ms = Math.max(1, Date.now() - t0);
+					if (!live) {
+						state.proxyCursor.at = (idx + 1) % n;
+						continue;
 					}
+					let country = cand.country || "";
+					if (!country) {
+						try {
+							const host = String(cand.proxy)
+								.replace(/^[a-z0-9]+:\/\//i, "")
+								.replace(/^.*@/, "")
+								.split(":")[0];
+							country = (await lookupExitCountry(host)) || "";
+							cand.country = country;
+						} catch (eC) {}
+					}
+					winner = {
+						proxy: cand.proxy,
+						ms: ms,
+						country: country,
+						city: cand.city || "",
+						protocol: cand.protocol || "",
+						apiTimeout: cand.apiTimeout,
+						uptime: cand.uptime,
+						index: idx,
+					};
+					state.proxyCursor.at = (idx + 1) % n;
+					break;
 				}
 				if (!winner) {
-					state.proxyCursor.at = (startIdx + maxTry) % n;
 					return new Response(JSON.stringify({ error: "No live proxy found, try again" }), {
 						status: 404,
 						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
 					});
 				}
-				return new Response(JSON.stringify({
-					proxy: winner.proxy,
-					ms: winner.ms,
-					country: winner.country || "",
-					source: "proxyscrape",
-					live: true,
-					verified: true,
-					index: winner.index,
-					next: state.proxyCursor.at
-				}), {
-					headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
-				});
+				return new Response(
+					JSON.stringify({
+						proxy: winner.proxy,
+						ms: winner.ms,
+						country: winner.country || "",
+						city: winner.city || "",
+						protocol: winner.protocol || "",
+						apiTimeout: winner.apiTimeout,
+						uptime: winner.uptime,
+						source: "proxyscrape-json",
+						live: true,
+						verified: true,
+						index: winner.index,
+						next: state.proxyCursor.at,
+						total: n,
+					}),
+					{
+						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+					}
+				);
 			} catch (e) {
-				return new Response(JSON.stringify({ error: "Random failed", detail: String(e && e.message || e) }), {
+				return new Response(JSON.stringify({ error: "Random failed", detail: String((e && e.message) || e) }), {
 					status: 500,
 					headers: { "Content-Type": "application/json; charset=utf-8" },
 				});
@@ -2191,7 +2249,7 @@ function getSelectedUserProxy(userSocks5, request) {
 const PROXIFLY_ALL_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json";
 const PROXIFLY_ALL_URL_GH = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.json";
 const EXIT_PROXY_SOURCES = [
-	{ name: "ProxyScrape", key: "proxyscrape", url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&timeout=1000", type: "text" },
+	{ name: "ProxyScrape", key: "proxyscrape", url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&timeout=1000", type: "text" },
 	{ name: "HProxy", key: "hproxy", url: "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/all.json", type: "json" },
 	{ name: "Databay", key: "databay", url: "https://databay.com/api/v1/proxy-list", type: "json" },
 ];
@@ -8309,10 +8367,12 @@ function CreateView({
         setExitProxy(proxyVal);
         const ms = j.ms != null ? j.ms : null;
         const loc = (j.country || "").toString().toUpperCase();
+        const city = (j.city || "").toString();
         setExitCountry(loc || "");
-        setExitStatus((ms != null ? ms + " ms" : "") + (loc ? (ms != null ? " · " : "") + loc : ""));
+        const locLabel = loc ? (city ? loc + "/" + city : loc) : "";
+        setExitStatus((ms != null ? ms + " ms" : "") + (locLabel ? (ms != null ? " · " : "") + locLabel : ""));
         if (mySeq === window.__tbRandSeq) {
-          onToast((ms != null ? ms + " ms" : "OK") + (loc ? " · " + loc : " · ?"), "ping");
+          onToast((ms != null ? ms + " ms" : "OK") + (locLabel ? " · " + locLabel : " · ?"), "ping");
         }
       } catch (e) {
         if (mySeq === window.__tbRandSeq) onToast("Random failed — try again", true);
