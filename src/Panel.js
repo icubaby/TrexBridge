@@ -6998,6 +6998,156 @@ const FINGERPRINTS = ["chrome", "firefox", "safari", "ios", "android", "edge", "
 const OPERATORS_FALLBACK = [{ key: "all", label: "All", count: 0 }];
 
 const VIP_COUNTRIES = ["DE", "US", "NL", "GB", "FR", "TR", "FI", "SE", "CA", "JP"];
+const EXIT_COUNTRIES = [
+  { code: "AF", label: "Afghanistan" },
+  { code: "AL", label: "Albania" },
+  { code: "DZ", label: "Algeria" },
+  { code: "AD", label: "Andorra" },
+  { code: "AO", label: "Angola" },
+  { code: "AR", label: "Argentina" },
+  { code: "AM", label: "Armenia" },
+  { code: "AU", label: "Australia" },
+  { code: "AT", label: "Austria" },
+  { code: "AZ", label: "Azerbaijan" },
+  { code: "BD", label: "Bangladesh" },
+  { code: "BY", label: "Belarus" },
+  { code: "BE", label: "Belgium" },
+  { code: "BJ", label: "Benin" },
+  { code: "BM", label: "Bermuda" },
+  { code: "BT", label: "Bhutan" },
+  { code: "BO", label: "Bolivia" },
+  { code: "BW", label: "Botswana" },
+  { code: "BG", label: "Bulgaria" },
+  { code: "BF", label: "Burkina Faso" },
+  { code: "BI", label: "Burundi" },
+  { code: "KH", label: "Cambodia" },
+  { code: "CM", label: "Cameroon" },
+  { code: "CA", label: "Canada" },
+  { code: "TD", label: "Chad" },
+  { code: "CL", label: "Chile" },
+  { code: "CN", label: "China" },
+  { code: "CO", label: "Colombia" },
+  { code: "CG", label: "Congo" },
+  { code: "CR", label: "Costa Rica" },
+  { code: "HR", label: "Croatia" },
+  { code: "CY", label: "Cyprus" },
+  { code: "CZ", label: "Czechia" },
+  { code: "DK", label: "Denmark" },
+  { code: "DO", label: "Dominican Republic" },
+  { code: "EC", label: "Ecuador" },
+  { code: "EG", label: "Egypt" },
+  { code: "SV", label: "El Salvador" },
+  { code: "GQ", label: "Equatorial Guinea" },
+  { code: "EE", label: "Estonia" },
+  { code: "SZ", label: "Eswatini" },
+  { code: "ET", label: "Ethiopia" },
+  { code: "FJ", label: "Fiji" },
+  { code: "FI", label: "Finland" },
+  { code: "FR", label: "France" },
+  { code: "GM", label: "Gambia" },
+  { code: "GE", label: "Georgia" },
+  { code: "DE", label: "Germany" },
+  { code: "GH", label: "Ghana" },
+  { code: "GI", label: "Gibraltar" },
+  { code: "GR", label: "Greece" },
+  { code: "GU", label: "Guam" },
+  { code: "GT", label: "Guatemala" },
+  { code: "GN", label: "Guinea" },
+  { code: "HT", label: "Haiti" },
+  { code: "HN", label: "Honduras" },
+  { code: "HK", label: "Hong Kong" },
+  { code: "HU", label: "Hungary" },
+  { code: "IN", label: "India" },
+  { code: "ID", label: "Indonesia" },
+  { code: "IR", label: "Iran" },
+  { code: "IQ", label: "Iraq" },
+  { code: "IE", label: "Ireland" },
+  { code: "IL", label: "Israel" },
+  { code: "IT", label: "Italy" },
+  { code: "JM", label: "Jamaica" },
+  { code: "JP", label: "Japan" },
+  { code: "JO", label: "Jordan" },
+  { code: "KZ", label: "Kazakhstan" },
+  { code: "KE", label: "Kenya" },
+  { code: "KR", label: "South Korea" },
+  { code: "KG", label: "Kyrgyzstan" },
+  { code: "LV", label: "Latvia" },
+  { code: "LB", label: "Lebanon" },
+  { code: "LS", label: "Lesotho" },
+  { code: "LT", label: "Lithuania" },
+  { code: "MG", label: "Madagascar" },
+  { code: "MW", label: "Malawi" },
+  { code: "MY", label: "Malaysia" },
+  { code: "MV", label: "Maldives" },
+  { code: "ML", label: "Mali" },
+  { code: "MT", label: "Malta" },
+  { code: "MU", label: "Mauritius" },
+  { code: "MX", label: "Mexico" },
+  { code: "MD", label: "Moldova" },
+  { code: "MN", label: "Mongolia" },
+  { code: "ME", label: "Montenegro" },
+  { code: "MA", label: "Morocco" },
+  { code: "MZ", label: "Mozambique" },
+  { code: "MM", label: "Myanmar" },
+  { code: "NA", label: "Namibia" },
+  { code: "NP", label: "Nepal" },
+  { code: "NL", label: "Netherlands" },
+  { code: "NZ", label: "New Zealand" },
+  { code: "NI", label: "Nicaragua" },
+  { code: "NG", label: "Nigeria" },
+  { code: "MK", label: "North Macedonia" },
+  { code: "NO", label: "Norway" },
+  { code: "PK", label: "Pakistan" },
+  { code: "PS", label: "Palestine" },
+  { code: "PA", label: "Panama" },
+  { code: "PY", label: "Paraguay" },
+  { code: "PE", label: "Peru" },
+  { code: "PH", label: "Philippines" },
+  { code: "PL", label: "Poland" },
+  { code: "PT", label: "Portugal" },
+  { code: "PR", label: "Puerto Rico" },
+  { code: "QA", label: "Qatar" },
+  { code: "RO", label: "Romania" },
+  { code: "RW", label: "Rwanda" },
+  { code: "KN", label: "Saint Kitts" },
+  { code: "SA", label: "Saudi Arabia" },
+  { code: "SN", label: "Senegal" },
+  { code: "RS", label: "Serbia" },
+  { code: "SC", label: "Seychelles" },
+  { code: "SL", label: "Sierra Leone" },
+  { code: "SG", label: "Singapore" },
+  { code: "SK", label: "Slovakia" },
+  { code: "SI", label: "Slovenia" },
+  { code: "SO", label: "Somalia" },
+  { code: "ZA", label: "South Africa" },
+  { code: "ES", label: "Spain" },
+  { code: "LK", label: "Sri Lanka" },
+  { code: "SD", label: "Sudan" },
+  { code: "SE", label: "Sweden" },
+  { code: "CH", label: "Switzerland" },
+  { code: "SY", label: "Syria" },
+  { code: "TW", label: "Taiwan" },
+  { code: "TJ", label: "Tajikistan" },
+  { code: "TZ", label: "Tanzania" },
+  { code: "TH", label: "Thailand" },
+  { code: "TL", label: "Timor-Leste" },
+  { code: "TG", label: "Togo" },
+  { code: "TN", label: "Tunisia" },
+  { code: "TR", label: "Turkey" },
+  { code: "UG", label: "Uganda" },
+  { code: "UA", label: "Ukraine" },
+  { code: "AE", label: "UAE" },
+  { code: "GB", label: "United Kingdom" },
+  { code: "US", label: "United States" },
+  { code: "UY", label: "Uruguay" },
+  { code: "UZ", label: "Uzbekistan" },
+  { code: "VE", label: "Venezuela" },
+  { code: "VN", label: "Vietnam" },
+  { code: "VI", label: "US Virgin Islands" },
+  { code: "YE", label: "Yemen" },
+  { code: "ZW", label: "Zimbabwe" }
+];
+
 const SAMPLE_IPS = {
   all: ["104.21.12.34", "172.67.45.67", "104.18.90.12", "162.159.1.10", "104.16.55.22", "104.19.88.3", "172.66.40.9"],
   IRANCELL: ["172.67.80.190", "104.16.36.165", "104.18.250.213"],
@@ -8350,7 +8500,16 @@ function CreateView({
     iconBg: "bg-[#db2777]",
     barBg: "bg-[#f472b6]",
     title: "Exit location",
-    sub: "Optional proxy exit"
+    sub: "Optional proxy exit",
+    right: /*#__PURE__*/React.createElement("button", {
+      type: "button",
+      disabled: !!exitBusy,
+      onClick: function () {
+        setShowExitLoc(function (v) { return !v; });
+      },
+      className: "text-xs font-extrabold px-3 py-1.5 border-[2.5px] border-black bg-[#f9a8d4] shadow-[2px_2px_0_#000]",
+      style: { opacity: exitBusy ? 0.5 : 1 }
+    }, "IP static")
   }), /*#__PURE__*/React.createElement("div", {
     className: "nb-card-b space-y-3"
   }, /*#__PURE__*/React.createElement(InField, {
@@ -8364,7 +8523,7 @@ function CreateView({
   }), exitStatus ? /*#__PURE__*/React.createElement("div", {
     className: "text-xs font-extrabold border-[2.5px] border-black px-2 py-1 shadow-[2px_2px_0_#000] bg-[#bbf7d0]"
   }, exitStatus) : null, /*#__PURE__*/React.createElement("div", {
-    className: "flex gap-2 flex-wrap"
+    className: "flex gap-2"
   }, /*#__PURE__*/React.createElement("button", {
     type: "button",
     disabled: !!exitBusy,
@@ -8411,14 +8570,6 @@ function CreateView({
   }, "Apply"), /*#__PURE__*/React.createElement("button", {
     type: "button",
     disabled: !!exitBusy,
-    onClick: function () {
-      setShowExitLoc(function (v) { return !v; });
-    },
-    className: "chip-pick flex-1",
-    style: { background: showExitLoc ? "#f9a8d4" : "#86efac", color: "#000", opacity: exitBusy ? 0.5 : 1 }
-  }, "IP static"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
     onClick: async function () {
       if (exitBusy) return;
       window.__tbRandSeq = (window.__tbRandSeq || 0) + 1;
@@ -8451,81 +8602,7 @@ function CreateView({
     },
     className: "chip-pick flex-1",
     style: { background: "#a78bfa", color: "#000", opacity: exitBusy ? 0.5 : 1 }
-  }, exitBusy ? "..." : "Random")), showExitLoc ? /*#__PURE__*/React.createElement("div", {
-    className: "flex flex-wrap gap-1.5"
-  }, /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#93c5fd", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("US", "USA"); }
-  }, "USA"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#fde68a", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("DE", "Germany"); }
-  }, "Germany"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#f9a8d4", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("NL", "Netherlands"); }
-  }, "Netherlands"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#a7f3d0", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("GB", "UK"); }
-  }, "UK"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#c4b5fd", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("FR", "France"); }
-  }, "France"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#fdba74", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("TR", "Turkey"); }
-  }, "Turkey"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#7dd3fc", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("CA", "Canada"); }
-  }, "Canada"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#fca5a5", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("FI", "Finland"); }
-  }, "Finland"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#bef264", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("PL", "Poland"); }
-  }, "Poland"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#fbcfe8", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("JP", "Japan"); }
-  }, "Japan"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#a5b4fc", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("SG", "Singapore"); }
-  }, "Singapore"), /*#__PURE__*/React.createElement("button", {
-    type: "button",
-    disabled: !!exitBusy,
-    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: { background: "#fcd34d", color: "#000", opacity: exitBusy ? 0.45 : 1 },
-    onClick: function () { return pickExitCountry("IT", "Italy"); }
-  }, "Italy")) : null)), /*#__PURE__*/React.createElement(StarDiv, null), /*#__PURE__*/React.createElement("div", {
+  }, exitBusy ? "..." : "Random")))), /*#__PURE__*/React.createElement(StarDiv, null), /*#__PURE__*/React.createElement("div", {
     className: "nb-card"
   }, /*#__PURE__*/React.createElement(Head, {
     icon: "dns",
@@ -8607,7 +8684,39 @@ function CreateView({
     style: {
       fontSize: 14
     }
-  }, "close"))))))), showIpModal && /*#__PURE__*/React.createElement("div", {
+  }, "close"))))))), showExitLoc && /*#__PURE__*/React.createElement("div", {
+    className: "fixed inset-0 z-[100] flex items-end sm:items-center justify-center p-4",
+    style: { background: "rgba(0,0,0,0.4)" },
+    onClick: function () { if (!exitBusy) setShowExitLoc(false); }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "w-full max-w-md bg-[#fffdf5] border-[3px] border-black shadow-[8px_8px_0_#000] anim-pop overflow-hidden",
+    onClick: function (e) { e.stopPropagation(); }
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center justify-between px-4 py-3 bg-[#f9a8d4] border-b-[3px] border-black"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "font-black text-[15px]",
+    style: { fontFamily: "Archivo, sans-serif" }
+  }, "IP static · locations"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    onClick: function () { setShowExitLoc(false); },
+    className: "w-8 h-8 border-2 border-black bg-black text-white font-black"
+  }, "×")), /*#__PURE__*/React.createElement("div", {
+    className: "p-3 max-h-[65vh] overflow-y-auto"
+  }, /*#__PURE__*/React.createElement("div", {
+    className: "grid grid-cols-2 gap-2"
+  }, EXIT_COUNTRIES.map(function (c, idx) {
+    var palette = ["bg-[#2563eb]","bg-[#7c3aed]","bg-[#db2777]","bg-[#ea580c]","bg-[#16a34a]","bg-[#0891b2]","bg-[#ca8a04]","bg-[#dc2626]","bg-[#4f46e5]","bg-[#c026d3]","bg-[#059669]","bg-[#d97706]"];
+    var bg = palette[idx % palette.length];
+    return /*#__PURE__*/React.createElement("button", {
+      key: c.code,
+      type: "button",
+      disabled: !!exitBusy,
+      onClick: function () { pickExitCountry(c.code, c.label); },
+      className: "text-[11px] font-extrabold px-2 py-2 border-[2.5px] border-black shadow-[2px_2px_0_#000] text-white truncate " + bg,
+      style: { opacity: exitBusy ? 0.45 : 1 }
+    }, c.label);
+  }))))), showIpModal && /*#__PURE__*/React.createElement("div", {
     className: "fixed inset-0 z-[100] flex items-end sm:items-center justify-center p-4",
     style: {
       background: "rgba(0,0,0,0.4)"
