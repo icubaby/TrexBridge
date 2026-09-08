@@ -7578,6 +7578,36 @@ function CreateView({
   const [exitBusy, setExitBusy] = useState(false);
   const [showExitLoc, setShowExitLoc] = useState(false);
   const [ipLoading, setIpLoading] = useState(false);
+  async function pickExitCountry(code, label) {
+    if (exitBusy) return;
+    window.__tbRandSeq = (window.__tbRandSeq || 0) + 1;
+    var mySeq = window.__tbRandSeq;
+    setExitBusy(true);
+    onToast("Finding " + (label || code) + "...", "ping");
+    try {
+      var res = await fetch("/api/random-proxy?country=" + encodeURIComponent(code) + "&t=" + Date.now(), { credentials: "same-origin", cache: "no-store" });
+      if (mySeq !== window.__tbRandSeq) return;
+      var j = await res.json().catch(function () { return {}; });
+      if (mySeq !== window.__tbRandSeq) return;
+      var proxyVal = j && j.proxy ? (typeof j.proxy === "string" ? j.proxy : j.proxy.proxy || null) : null;
+      if (!res.ok || !proxyVal || j.live === false) {
+        onToast((j && j.error) || ("No live proxy in " + code), true);
+        return;
+      }
+      setExitProxy(proxyVal);
+      var ms = j.ms != null ? j.ms : null;
+      var loc = (j.country || code).toString().toUpperCase();
+      var city = (j.city || "").toString();
+      setExitCountry(loc);
+      setExitStatus((ms != null ? ms + " ms" : "") + " · " + loc + (city ? "/" + city : ""));
+      onToast((ms != null ? ms + " ms" : "OK") + " · " + loc, "ping");
+    } catch (e) {
+      if (mySeq === window.__tbRandSeq) onToast("Location failed", true);
+    } finally {
+      if (mySeq === window.__tbRandSeq) setExitBusy(false);
+    }
+  }
+
   const [creating, setCreating] = useState(false);
   useEffect(() => {
     if (!editUser) return;
@@ -8327,7 +8357,7 @@ function CreateView({
     icon: "vpn_key",
     placeholder: "socks5://host:port",
     value: exitProxy,
-    onChange: e => {
+    onChange: function (e) {
       setExitProxy(e.target.value);
       setExitStatus("");
     }
@@ -8338,22 +8368,18 @@ function CreateView({
   }, /*#__PURE__*/React.createElement("button", {
     type: "button",
     disabled: !!exitBusy,
-    onClick: async () => {
+    onClick: async function () {
       if (!exitProxy) return onToast("No proxy", true);
       try {
-        const res = await fetch("/api/test-proxy", {
+        var res = await fetch("/api/test-proxy", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
+          headers: { "Content-Type": "application/json" },
           credentials: "same-origin",
-          body: JSON.stringify({
-            proxy: exitProxy
-          })
+          body: JSON.stringify({ proxy: exitProxy })
         });
-        const j = await res.json().catch(() => ({}));
-        const ms = j.ms != null ? j.ms : j.ping;
-        const loc = (j.country || j.loc || j.countryCode || "").toString().toUpperCase();
+        var j = await res.json().catch(function () { return {}; });
+        var ms = j.ms != null ? j.ms : j.ping;
+        var loc = (j.country || j.loc || j.countryCode || "").toString().toUpperCase();
         if (res.ok) {
           setExitStatus((ms != null ? ms + " ms" : "") + (loc ? (ms != null ? " · " : "") + loc : ""));
           onToast("ms " + (ms != null ? ms : "?") + (loc ? " " + loc : ""), "ping");
@@ -8366,16 +8392,12 @@ function CreateView({
       }
     },
     className: "chip-pick flex-1",
-    style: {
-      background: "#7dd3fc",
-      color: "#000",
-      opacity: exitBusy ? 0.5 : 1
-    }
+    style: { background: "#7dd3fc", color: "#000", opacity: exitBusy ? 0.5 : 1 }
   }, "Test"), /*#__PURE__*/React.createElement("button", {
     type: "button",
     disabled: !!exitBusy,
-    onClick: () => {
-      if (!exitProxy.trim()) {
+    onClick: function () {
+      if (!String(exitProxy || "").trim()) {
         setExitProxy("");
         setExitCountry("");
         setExitStatus("");
@@ -8385,51 +8407,42 @@ function CreateView({
       onToast("Applied", "success");
     },
     className: "chip-pick flex-1",
-    style: {
-      background: "#facc15",
-      color: "#000",
-      opacity: exitBusy ? 0.5 : 1
-    }
+    style: { background: "#facc15", color: "#000", opacity: exitBusy ? 0.5 : 1 }
   }, "Apply"), /*#__PURE__*/React.createElement("button", {
     type: "button",
     disabled: !!exitBusy,
-    onClick: () => setShowExitLoc(v => !v),
+    onClick: function () {
+      setShowExitLoc(function (v) { return !v; });
+    },
     className: "chip-pick flex-1",
-    style: {
-      background: showExitLoc ? "#f9a8d4" : "#86efac",
-      color: "#000",
-      opacity: exitBusy ? 0.5 : 1
-    }
+    style: { background: showExitLoc ? "#f9a8d4" : "#86efac", color: "#000", opacity: exitBusy ? 0.5 : 1 }
   }, "IP static"), /*#__PURE__*/React.createElement("button", {
     type: "button",
     disabled: !!exitBusy,
-    onClick: async () => {
+    onClick: async function () {
       if (exitBusy) return;
       window.__tbRandSeq = (window.__tbRandSeq || 0) + 1;
-      const mySeq = window.__tbRandSeq;
+      var mySeq = window.__tbRandSeq;
       setExitBusy(true);
-      onToast("Checking proxies…", "ping");
+      onToast("Checking proxies...", "ping");
       try {
-        const res = await fetch("/api/random-proxy?find=1&t=" + Date.now(), {
-          credentials: "same-origin",
-          cache: "no-store"
-        });
+        var res = await fetch("/api/random-proxy?find=1&t=" + Date.now(), { credentials: "same-origin", cache: "no-store" });
         if (mySeq !== window.__tbRandSeq) return;
-        const j = await res.json().catch(() => ({}));
+        var j = await res.json().catch(function () { return {}; });
         if (mySeq !== window.__tbRandSeq) return;
-        let proxyVal = j && j.proxy ? (typeof j.proxy === "string" ? j.proxy : j.proxy.proxy || j.proxy.url || null) : null;
+        var proxyVal = j && j.proxy ? (typeof j.proxy === "string" ? j.proxy : j.proxy.proxy || null) : null;
         if (!res.ok || !proxyVal || j.live === false) {
-          onToast((j && j.error) || "No live proxy — try Random again", true);
+          onToast((j && j.error) || "No live proxy - try Random again", true);
           return;
         }
         setExitProxy(proxyVal);
-        const ms = j.ms != null ? j.ms : null;
-        const loc = (j.country || "").toString().toUpperCase();
-        const city = (j.city || "").toString();
-        setExitCountry(loc || "");
-        const locLabel = loc ? (city ? loc + "/" + city : loc) : "";
-        setExitStatus((ms != null ? ms + " ms" : "") + (locLabel ? (ms != null ? " · " : "") + locLabel : ""));
-        onToast((ms != null ? ms + " ms" : "OK") + (locLabel ? " · " + locLabel : "") + (j.tried > 1 ? " · tried " + j.tried : ""), "ping");
+        var ms2 = j.ms != null ? j.ms : null;
+        var loc2 = (j.country || "").toString().toUpperCase();
+        var city2 = (j.city || "").toString();
+        setExitCountry(loc2 || "");
+        var locLabel = loc2 ? (city2 ? loc2 + "/" + city2 : loc2) : "";
+        setExitStatus((ms2 != null ? ms2 + " ms" : "") + (locLabel ? (ms2 != null ? " · " : "") + locLabel : ""));
+        onToast((ms2 != null ? ms2 + " ms" : "OK") + (locLabel ? " · " + locLabel : ""), "ping");
       } catch (e) {
         if (mySeq === window.__tbRandSeq) onToast("Random failed", true);
       } finally {
@@ -8437,104 +8450,82 @@ function CreateView({
       }
     },
     className: "chip-pick flex-1",
-    style: {
-      background: "#a78bfa",
-      color: "#000",
-      opacity: exitBusy ? 0.5 : 1
-    }
-  }, exitBusy ? "…" : "Random")), showExitLoc ? /*#__PURE__*/React.createElement("div", {
+    style: { background: "#a78bfa", color: "#000", opacity: exitBusy ? 0.5 : 1 }
+  }, exitBusy ? "..." : "Random")), showExitLoc ? /*#__PURE__*/React.createElement("div", {
     className: "flex flex-wrap gap-1.5"
-  }, [{
-    code: "US",
-    label: "USA",
-    bg: "#93c5fd"
-  }, {
-    code: "DE",
-    label: "Germany",
-    bg: "#fde68a"
-  }, {
-    code: "NL",
-    label: "Netherlands",
-    bg: "#f9a8d4"
-  }, {
-    code: "GB",
-    label: "UK",
-    bg: "#a7f3d0"
-  }, {
-    code: "FR",
-    label: "France",
-    bg: "#c4b5fd"
-  }, {
-    code: "TR",
-    label: "Turkey",
-    bg: "#fdba74"
-  }, {
-    code: "CA",
-    label: "Canada",
-    bg: "#7dd3fc"
-  }, {
-    code: "FI",
-    label: "Finland",
-    bg: "#fca5a5"
-  }, {
-    code: "PL",
-    label: "Poland",
-    bg: "#bef264"
-  }, {
-    code: "JP",
-    label: "Japan",
-    bg: "#fbcfe8"
-  }, {
-    code: "SG",
-    label: "Singapore",
-    bg: "#a5b4fc"
-  }, {
-    code: "IT",
-    label: "Italy",
-    bg: "#fcd34d"
-  }].map(c => /*#__PURE__*/React.createElement("button", {
-    key: c.code,
+  }, /*#__PURE__*/React.createElement("button", {
     type: "button",
     disabled: !!exitBusy,
-    onClick: async () => {
-      if (exitBusy) return;
-      window.__tbRandSeq = (window.__tbRandSeq || 0) + 1;
-      const mySeq = window.__tbRandSeq;
-      setExitBusy(true);
-      onToast("Finding " + c.label + "…", "ping");
-      try {
-        const res = await fetch("/api/random-proxy?country=" + encodeURIComponent(c.code) + "&t=" + Date.now(), {
-          credentials: "same-origin",
-          cache: "no-store"
-        });
-        if (mySeq !== window.__tbRandSeq) return;
-        const j = await res.json().catch(() => ({}));
-        if (mySeq !== window.__tbRandSeq) return;
-        let proxyVal = j && j.proxy ? (typeof j.proxy === "string" ? j.proxy : j.proxy.proxy || null) : null;
-        if (!res.ok || !proxyVal || j.live === false) {
-          onToast((j && j.error) || ("No live proxy in " + c.code), true);
-          return;
-        }
-        setExitProxy(proxyVal);
-        const ms = j.ms != null ? j.ms : null;
-        const loc = (j.country || c.code).toString().toUpperCase();
-        const city = (j.city || "").toString();
-        setExitCountry(loc);
-        setExitStatus((ms != null ? ms + " ms" : "") + " · " + loc + (city ? "/" + city : ""));
-        onToast((ms != null ? ms + " ms" : "OK") + " · " + loc + (j.tried > 1 ? " · tried " + j.tried : ""), "ping");
-      } catch (e) {
-        if (mySeq === window.__tbRandSeq) onToast("Location failed", true);
-      } finally {
-        if (mySeq === window.__tbRandSeq) setExitBusy(false);
-      }
-    },
     className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
-    style: {
-      background: c.bg,
-      color: "#000",
-      opacity: exitBusy ? 0.45 : 1
-    }
-  }, c.label))) : null), /*#__PURE__*/React.createElement(StarDiv, null), /*#__PURE__*/React.createElement("div", {
+    style: { background: "#93c5fd", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("US", "USA"); }
+  }, "USA"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#fde68a", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("DE", "Germany"); }
+  }, "Germany"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#f9a8d4", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("NL", "Netherlands"); }
+  }, "Netherlands"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#a7f3d0", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("GB", "UK"); }
+  }, "UK"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#c4b5fd", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("FR", "France"); }
+  }, "France"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#fdba74", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("TR", "Turkey"); }
+  }, "Turkey"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#7dd3fc", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("CA", "Canada"); }
+  }, "Canada"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#fca5a5", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("FI", "Finland"); }
+  }, "Finland"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#bef264", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("PL", "Poland"); }
+  }, "Poland"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#fbcfe8", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("JP", "Japan"); }
+  }, "Japan"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#a5b4fc", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("SG", "Singapore"); }
+  }, "Singapore"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: { background: "#fcd34d", color: "#000", opacity: exitBusy ? 0.45 : 1 },
+    onClick: function () { return pickExitCountry("IT", "Italy"); }
+  }, "Italy")) : null)), /*#__PURE__*/React.createElement(StarDiv, null), /*#__PURE__*/React.createElement("div", {
     className: "nb-card"
   }, /*#__PURE__*/React.createElement(Head, {
     icon: "dns",
