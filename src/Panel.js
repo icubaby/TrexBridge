@@ -31,8 +31,7 @@ const FLUX_QUERY =
   "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
 const FLUX_QUERY_SAFE =
   "&fragment=" + encodeURIComponent("tlshello,5,94,1,0");
-const DEFAULT_FRAG_QUERY =
-  "&fragment=" + encodeURIComponent("tlshello,100-200,1-1,100-200");
+const DEFAULT_FRAG_QUERY = "";
 const FLUX_JSON = JSON.stringify({
   mode: "flux",
   packets: "tlshello",
@@ -48,11 +47,12 @@ const FLUX_JSON = JSON.stringify({
 });
 const DEFAULT_FRAG_JSON = JSON.stringify({
   mode: "default",
-  packets: "tlshello",
-  length: "100-200",
-  interval: "1-1",
-  maxSplit: "100-200",
+  packets: "",
+  length: "",
+  interval: "",
+  maxSplit: "",
   protocols: "vless",
+  fragment: false,
 });
 
 const CLEAN_IP_URL =
@@ -191,8 +191,8 @@ function fragOptions(user) {
     }
   } catch (e) {}
   return {
-    query: useFlux ? FLUX_QUERY : DEFAULT_FRAG_QUERY,
-    querySafe: useFlux ? FLUX_QUERY_SAFE : DEFAULT_FRAG_QUERY,
+    query: useFlux ? FLUX_QUERY : "",
+    querySafe: useFlux ? FLUX_QUERY_SAFE : "",
     protos,
     flux: useFlux,
   };
@@ -204,7 +204,7 @@ function configLinks(user, host) {
   const fp = (user && user.fingerprint) || "chrome";
   const path = encodeURIComponent("/api/ws");
   const frag = fragOptions(user);
-  const userFrag = frag && frag.flux === false ? DEFAULT_FRAG_QUERY : FLUX_QUERY;
+  const userFrag = frag && frag.flux === false ? "" : FLUX_QUERY;
   const protos = frag.protos && frag.protos.length ? frag.protos : ["vless"];
   const uuid = (user && user.uuid) || "";
   const links = [];
@@ -996,41 +996,27 @@ const Router = {
 					});
 				}
 				const now = Date.now();
-				const SRC =
-					"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
-				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 120000) {
-					const res = await fetch(SRC + (SRC.includes("?") ? "&" : "?") + "_=" + now, {
-						headers: {
-							Accept: "application/json,*/*",
-							"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-						},
-					});
-					if (!res.ok) {
-						return new Response(JSON.stringify({ error: "Proxy source error", status: res.status }), {
-							status: 502,
-							headers: { "Content-Type": "application/json; charset=utf-8" },
-						});
-					}
-					let data = null;
+				const countryQ = String(url.searchParams.get("country") || "").trim().toLowerCase();
+				const wantCountry = countryQ && countryQ !== "all" ? countryQ.slice(0, 2) : "";
+				const findLive = url.searchParams.get("find") === "1";
+
+				async function pingOne(proxyUrl) {
+					const t0 = Date.now();
+					let live = false;
 					try {
-						data = await res.json();
-					} catch (eJ) {
-						return new Response(JSON.stringify({ error: "Proxy JSON parse failed" }), {
-							status: 502,
-							headers: { "Content-Type": "application/json; charset=utf-8" },
-						});
+						live = await isProxyLive(proxyUrl, 1400);
+					} catch (_) {
+						live = false;
 					}
-					const arr = Array.isArray(data)
-						? data
-						: Array.isArray(data && data.proxies)
-							? data.proxies
-							: [];
-					const candidates = [];
+					return { live, ms: Math.max(1, Date.now() - t0) };
+				}
+
+				function parseRows(arr) {
+					const out = [];
 					const seen = new Set();
-					for (let li = 0; li < arr.length; li++) {
+					for (let li = 0; li < (arr || []).length; li++) {
 						const row = arr[li];
 						if (!row || typeof row !== "object") continue;
-						// Prefer API-marked alive; skip known dead when field exists
 						if (row.alive === false) continue;
 						let proxy = String(row.proxy || "").trim();
 						if (!proxy) {
@@ -1042,48 +1028,113 @@ const Router = {
 						if (!proxy) continue;
 						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) {
 							const proto = String(row.protocol || "socks5").toLowerCase();
-							proxy = (/^socks5|socks4|http|https$/i.test(proto) ? proto : "socks5") + "://" + proxy;
+							proxy = (/socks5|socks4|http|https/i.test(proto) ? proto : "socks5") + "://" + proxy;
+						}
+						// prefer socks5 for Worker exit
+						if (!/socks5/i.test(proxy) && !/socks5/i.test(String(row.protocol || ""))) {
+							// still allow socks4/http but rank lower later
 						}
 						const key = proxy.toLowerCase();
 						if (seen.has(key)) continue;
 						seen.add(key);
 						const ipData = row.ip_data && typeof row.ip_data === "object" ? row.ip_data : {};
-						const country = String(
-							ipData.countryCode || ipData.country_code || row.countryCode || row.country || ""
-						)
+						const country = String(ipData.countryCode || ipData.country_code || row.countryCode || row.country || "")
 							.trim()
 							.toUpperCase();
 						const city = String(ipData.city || row.city || "").trim();
-						const apiTimeout =
-							typeof row.timeout === "number"
-								? Math.round(row.timeout)
-								: typeof row.average_timeout === "number"
-									? Math.round(row.average_timeout)
-									: null;
-						candidates.push({
-							proxy: proxy,
-							country: country,
-							city: city,
-							protocol: String(row.protocol || "").toLowerCase(),
-							alive: row.alive === true,
-							apiTimeout: apiTimeout,
-							uptime: typeof row.uptime === "number" ? row.uptime : null,
+						const apiTo = typeof row.timeout === "number" ? row.timeout : typeof row.average_timeout === "number" ? row.average_timeout : 99999;
+						out.push({ proxy, country, city, apiTo, protocol: String(row.protocol || "").toLowerCase() });
+					}
+					out.sort(function (a, b) {
+						const ra = /socks5/.test(a.protocol || a.proxy) ? 0 : 1;
+						const rb = /socks5/.test(b.protocol || b.proxy) ? 0 : 1;
+						if (ra !== rb) return ra - rb;
+						return a.apiTo - b.apiTo;
+					});
+					return out;
+				}
+
+				if (wantCountry) {
+					const SRC =
+						"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&country=" +
+						encodeURIComponent(wantCountry) +
+						"&limit=25";
+					const res = await fetch(SRC + "&_=" + now, {
+						headers: { Accept: "application/json,*/*", "User-Agent": "Mozilla/5.0" },
+					});
+					if (!res.ok) {
+						return new Response(JSON.stringify({ error: "Proxy source error" }), {
+							status: 502,
+							headers: { "Content-Type": "application/json; charset=utf-8" },
 						});
 					}
-					// Prefer socks5, then socks4, then http — keep relative order within group
-					candidates.sort(function (a, b) {
-						const rank = function (p) {
-							if (/socks5/i.test(p.protocol || p.proxy)) return 0;
-							if (/socks4/i.test(p.protocol || p.proxy)) return 1;
-							return 2;
-						};
-						const ra = rank(a);
-						const rb = rank(b);
-						if (ra !== rb) return ra - rb;
-						// alive true first
-						if (a.alive !== b.alive) return a.alive ? -1 : 1;
-						return 0;
+					let data;
+					try {
+						data = await res.json();
+					} catch (_) {
+						return new Response(JSON.stringify({ error: "Bad proxy JSON" }), {
+							status: 502,
+							headers: { "Content-Type": "application/json; charset=utf-8" },
+						});
+					}
+					const arr = Array.isArray(data) ? data : Array.isArray(data && data.proxies) ? data.proxies : [];
+					const pool = parseRows(arr);
+					const maxTry = Math.min(4, pool.length);
+					let tried = 0;
+					for (let ti = 0; ti < maxTry; ti++) {
+						tried++;
+						const cand = pool[ti];
+						const r = await pingOne(cand.proxy);
+						if (!r.live) continue;
+						return new Response(
+							JSON.stringify({
+								proxy: cand.proxy,
+								ms: r.ms,
+								country: cand.country || wantCountry.toUpperCase(),
+								city: cand.city || "",
+								live: true,
+								verified: true,
+								tried: tried,
+								source: "country",
+							}),
+							{ headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }
+						);
+					}
+					return new Response(
+						JSON.stringify({
+							error: "No live proxy in " + wantCountry.toUpperCase(),
+							live: false,
+							tried: tried,
+							country: wantCountry.toUpperCase(),
+						}),
+						{ status: 404, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }
+					);
+				}
+
+				// Random: cache list, try up to 5 sequential pings max when find=1, else 1
+				const SRC =
+					"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&limit=80";
+				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 180000) {
+					const res = await fetch(SRC + (SRC.includes("?") ? "&" : "?") + "_=" + now, {
+						headers: { Accept: "application/json,*/*", "User-Agent": "Mozilla/5.0" },
 					});
+					if (!res.ok) {
+						return new Response(JSON.stringify({ error: "Proxy source error" }), {
+							status: 502,
+							headers: { "Content-Type": "application/json; charset=utf-8" },
+						});
+					}
+					let data;
+					try {
+						data = await res.json();
+					} catch (_) {
+						return new Response(JSON.stringify({ error: "Bad proxy JSON" }), {
+							status: 502,
+							headers: { "Content-Type": "application/json; charset=utf-8" },
+						});
+					}
+					const arr = Array.isArray(data) ? data : Array.isArray(data && data.proxies) ? data.proxies : [];
+					const candidates = parseRows(arr);
 					if (!candidates.length) {
 						return new Response(JSON.stringify({ error: "No proxies from source" }), {
 							status: 404,
@@ -1100,74 +1151,45 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
+				const maxTry = findLive ? Math.min(5, n) : 1;
+				let tried = 0;
 				const startIdx = ((state.proxyCursor.at % n) + n) % n;
-				const maxTry = Math.min(40, n);
-				let winner = null;
 				for (let k = 0; k < maxTry; k++) {
 					const idx = (startIdx + k) % n;
 					const cand = list[idx];
-					if (!cand || !cand.proxy) continue;
-					const t0 = Date.now();
-					let live = false;
-					try {
-						live = await isProxyLive(cand.proxy, 2500);
-					} catch (ePing) {
-						live = false;
-					}
-					const ms = Math.max(1, Date.now() - t0);
-					if (!live) {
-						state.proxyCursor.at = (idx + 1) % n;
-						continue;
-					}
-					let country = cand.country || "";
-					if (!country) {
-						try {
-							const host = String(cand.proxy)
-								.replace(/^[a-z0-9]+:\/\//i, "")
-								.replace(/^.*@/, "")
-								.split(":")[0];
-							country = (await lookupExitCountry(host)) || "";
-							cand.country = country;
-						} catch (eC) {}
-					}
-					winner = {
-						proxy: cand.proxy,
-						ms: ms,
-						country: country,
-						city: cand.city || "",
-						protocol: cand.protocol || "",
-						apiTimeout: cand.apiTimeout,
-						uptime: cand.uptime,
-						index: idx,
-					};
 					state.proxyCursor.at = (idx + 1) % n;
-					break;
-				}
-				if (!winner) {
-					return new Response(JSON.stringify({ error: "No live proxy found, try again" }), {
-						status: 404,
-						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
-					});
+					tried++;
+					if (!cand || !cand.proxy) continue;
+					const r = await pingOne(cand.proxy);
+					if (!r.live) continue;
+					return new Response(
+						JSON.stringify({
+							proxy: cand.proxy,
+							ms: r.ms,
+							country: cand.country || "",
+							city: cand.city || "",
+							live: true,
+							verified: true,
+							tried: tried,
+							index: idx,
+							next: state.proxyCursor.at,
+							total: n,
+							source: "random",
+						}),
+						{ headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }
+					);
 				}
 				return new Response(
 					JSON.stringify({
-						proxy: winner.proxy,
-						ms: winner.ms,
-						country: winner.country || "",
-						city: winner.city || "",
-						protocol: winner.protocol || "",
-						apiTimeout: winner.apiTimeout,
-						uptime: winner.uptime,
-						source: "proxyscrape-json",
-						live: true,
-						verified: true,
-						index: winner.index,
+						error: findLive
+							? "No live proxy in this batch — press Random again"
+							: "This proxy has no ping — press Random again",
+						live: false,
+						tried: tried,
 						next: state.proxyCursor.at,
 						total: n,
 					}),
-					{
-						headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
-					}
+					{ status: 404, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }
 				);
 			} catch (e) {
 				return new Response(JSON.stringify({ error: "Random failed", detail: String((e && e.message) || e) }), {
@@ -7553,6 +7575,8 @@ function CreateView({
   const [exitProxy, setExitProxy] = useState("");
   const [exitCountry, setExitCountry] = useState("");
   const [exitStatus, setExitStatus] = useState("");
+  const [exitBusy, setExitBusy] = useState(false);
+  const [showExitLoc, setShowExitLoc] = useState(false);
   const [ipLoading, setIpLoading] = useState(false);
   const [creating, setCreating] = useState(false);
   useEffect(() => {
@@ -7761,10 +7785,11 @@ function CreateView({
     } else {
       fragBase = {
         mode: "default",
-        packets: "tlshello",
-        length: "100-200",
-        interval: "1-1",
-        maxSplit: "100-200",
+        packets: "",
+        length: "",
+        interval: "",
+        maxSplit: "",
+        fragment: false,
         protocols: protos.join(",")
       };
     }
@@ -8306,18 +8331,25 @@ function CreateView({
       setExitProxy(e.target.value);
       setExitStatus("");
     }
-  }), /*#__PURE__*/React.createElement("div", {
-    className: "flex gap-2"
+  }), exitStatus ? /*#__PURE__*/React.createElement("div", {
+    className: "text-xs font-extrabold border-[2.5px] border-black px-2 py-1 shadow-[2px_2px_0_#000] bg-[#bbf7d0]"
+  }, exitStatus) : null, /*#__PURE__*/React.createElement("div", {
+    className: "flex gap-2 flex-wrap"
   }, /*#__PURE__*/React.createElement("button", {
     type: "button",
+    disabled: !!exitBusy,
     onClick: async () => {
       if (!exitProxy) return onToast("No proxy", true);
       try {
         const res = await fetch("/api/test-proxy", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json"
+          },
           credentials: "same-origin",
-          body: JSON.stringify({ proxy: exitProxy })
+          body: JSON.stringify({
+            proxy: exitProxy
+          })
         });
         const j = await res.json().catch(() => ({}));
         const ms = j.ms != null ? j.ms : j.ping;
@@ -8334,12 +8366,18 @@ function CreateView({
       }
     },
     className: "chip-pick flex-1",
-    style: { background: "#7dd3fc", color: "#000" }
+    style: {
+      background: "#7dd3fc",
+      color: "#000",
+      opacity: exitBusy ? 0.5 : 1
+    }
   }, "Test"), /*#__PURE__*/React.createElement("button", {
     type: "button",
+    disabled: !!exitBusy,
     onClick: () => {
       if (!exitProxy.trim()) {
         setExitProxy("");
+        setExitCountry("");
         setExitStatus("");
         onToast("Cleared");
         return;
@@ -8347,24 +8385,41 @@ function CreateView({
       onToast("Applied", "success");
     },
     className: "chip-pick flex-1",
-    style: { background: "#facc15", color: "#000" }
+    style: {
+      background: "#facc15",
+      color: "#000",
+      opacity: exitBusy ? 0.5 : 1
+    }
   }, "Apply"), /*#__PURE__*/React.createElement("button", {
     type: "button",
+    disabled: !!exitBusy,
+    onClick: () => setShowExitLoc(v => !v),
+    className: "chip-pick flex-1",
+    style: {
+      background: showExitLoc ? "#f9a8d4" : "#86efac",
+      color: "#000",
+      opacity: exitBusy ? 0.5 : 1
+    }
+  }, "IP static"), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    disabled: !!exitBusy,
     onClick: async () => {
+      if (exitBusy) return;
       window.__tbRandSeq = (window.__tbRandSeq || 0) + 1;
       const mySeq = window.__tbRandSeq;
-      onToast("Picking…", "ping");
+      setExitBusy(true);
+      onToast("Checking proxies…", "ping");
       try {
-        const res = await fetch("/api/random-proxy?t=" + Date.now() + "&r=" + Math.random().toString(36).slice(2), { credentials: "same-origin", cache: "no-store" });
+        const res = await fetch("/api/random-proxy?find=1&t=" + Date.now(), {
+          credentials: "same-origin",
+          cache: "no-store"
+        });
         if (mySeq !== window.__tbRandSeq) return;
         const j = await res.json().catch(() => ({}));
         if (mySeq !== window.__tbRandSeq) return;
-        let proxyVal = null;
-        if (j && j.proxy) {
-          proxyVal = typeof j.proxy === "string" ? j.proxy : (j.proxy.proxy || j.proxy.url || null);
-        }
-        if (!res.ok || !proxyVal) {
-          if (mySeq === window.__tbRandSeq) onToast((j && (j.error || j.detail)) || "No live proxy — try again", true);
+        let proxyVal = j && j.proxy ? (typeof j.proxy === "string" ? j.proxy : j.proxy.proxy || j.proxy.url || null) : null;
+        if (!res.ok || !proxyVal || j.live === false) {
+          onToast((j && j.error) || "No live proxy — try Random again", true);
           return;
         }
         setExitProxy(proxyVal);
@@ -8374,16 +8429,112 @@ function CreateView({
         setExitCountry(loc || "");
         const locLabel = loc ? (city ? loc + "/" + city : loc) : "";
         setExitStatus((ms != null ? ms + " ms" : "") + (locLabel ? (ms != null ? " · " : "") + locLabel : ""));
-        if (mySeq === window.__tbRandSeq) {
-          onToast((ms != null ? ms + " ms" : "OK") + (locLabel ? " · " + locLabel : " · ?"), "ping");
-        }
+        onToast((ms != null ? ms + " ms" : "OK") + (locLabel ? " · " + locLabel : "") + (j.tried > 1 ? " · tried " + j.tried : ""), "ping");
       } catch (e) {
-        if (mySeq === window.__tbRandSeq) onToast("Random failed — try again", true);
+        if (mySeq === window.__tbRandSeq) onToast("Random failed", true);
+      } finally {
+        if (mySeq === window.__tbRandSeq) setExitBusy(false);
       }
     },
     className: "chip-pick flex-1",
-    style: { background: "#a78bfa", color: "#000" }
-  }, "Random")))), /*#__PURE__*/React.createElement(StarDiv, null), /*#__PURE__*/React.createElement("div", {
+    style: {
+      background: "#a78bfa",
+      color: "#000",
+      opacity: exitBusy ? 0.5 : 1
+    }
+  }, exitBusy ? "…" : "Random")), showExitLoc ? /*#__PURE__*/React.createElement("div", {
+    className: "flex flex-wrap gap-1.5"
+  }, [{
+    code: "US",
+    label: "USA",
+    bg: "#93c5fd"
+  }, {
+    code: "DE",
+    label: "Germany",
+    bg: "#fde68a"
+  }, {
+    code: "NL",
+    label: "Netherlands",
+    bg: "#f9a8d4"
+  }, {
+    code: "GB",
+    label: "UK",
+    bg: "#a7f3d0"
+  }, {
+    code: "FR",
+    label: "France",
+    bg: "#c4b5fd"
+  }, {
+    code: "TR",
+    label: "Turkey",
+    bg: "#fdba74"
+  }, {
+    code: "CA",
+    label: "Canada",
+    bg: "#7dd3fc"
+  }, {
+    code: "FI",
+    label: "Finland",
+    bg: "#fca5a5"
+  }, {
+    code: "PL",
+    label: "Poland",
+    bg: "#bef264"
+  }, {
+    code: "JP",
+    label: "Japan",
+    bg: "#fbcfe8"
+  }, {
+    code: "SG",
+    label: "Singapore",
+    bg: "#a5b4fc"
+  }, {
+    code: "IT",
+    label: "Italy",
+    bg: "#fcd34d"
+  }].map(c => /*#__PURE__*/React.createElement("button", {
+    key: c.code,
+    type: "button",
+    disabled: !!exitBusy,
+    onClick: async () => {
+      if (exitBusy) return;
+      window.__tbRandSeq = (window.__tbRandSeq || 0) + 1;
+      const mySeq = window.__tbRandSeq;
+      setExitBusy(true);
+      onToast("Finding " + c.label + "…", "ping");
+      try {
+        const res = await fetch("/api/random-proxy?country=" + encodeURIComponent(c.code) + "&t=" + Date.now(), {
+          credentials: "same-origin",
+          cache: "no-store"
+        });
+        if (mySeq !== window.__tbRandSeq) return;
+        const j = await res.json().catch(() => ({}));
+        if (mySeq !== window.__tbRandSeq) return;
+        let proxyVal = j && j.proxy ? (typeof j.proxy === "string" ? j.proxy : j.proxy.proxy || null) : null;
+        if (!res.ok || !proxyVal || j.live === false) {
+          onToast((j && j.error) || ("No live proxy in " + c.code), true);
+          return;
+        }
+        setExitProxy(proxyVal);
+        const ms = j.ms != null ? j.ms : null;
+        const loc = (j.country || c.code).toString().toUpperCase();
+        const city = (j.city || "").toString();
+        setExitCountry(loc);
+        setExitStatus((ms != null ? ms + " ms" : "") + " · " + loc + (city ? "/" + city : ""));
+        onToast((ms != null ? ms + " ms" : "OK") + " · " + loc + (j.tried > 1 ? " · tried " + j.tried : ""), "ping");
+      } catch (e) {
+        if (mySeq === window.__tbRandSeq) onToast("Location failed", true);
+      } finally {
+        if (mySeq === window.__tbRandSeq) setExitBusy(false);
+      }
+    },
+    className: "text-[11px] font-extrabold px-2.5 py-1.5 border-[2.5px] border-black shadow-[2px_2px_0_#000]",
+    style: {
+      background: c.bg,
+      color: "#000",
+      opacity: exitBusy ? 0.45 : 1
+    }
+  }, c.label))) : null), /*#__PURE__*/React.createElement(StarDiv, null), /*#__PURE__*/React.createElement("div", {
     className: "nb-card"
   }, /*#__PURE__*/React.createElement(Head, {
     icon: "dns",
@@ -9344,7 +9495,7 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
     var _raw = u.frag_len ? String(u.frag_len) : "";
     if (_raw) {
       if (_raw.indexOf("default") >= 0 && _raw.indexOf("flux") < 0 && _raw.indexOf("trex") < 0 && _raw.indexOf("packets2") < 0) {
-        fragQ = "&fragment=" + encodeURIComponent("tlshello,100-200,1-1,100-200");
+        fragQ = "";
       }
       if (_raw.indexOf("trex") >= 0 || _raw.indexOf("flux") >= 0 || _raw.indexOf("packets2") >= 0 || _raw.indexOf("5,94,1") >= 0 || _raw.indexOf("dual") >= 0) {
         fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") + "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
@@ -9357,8 +9508,8 @@ var ports = String(u.port || "443").split(",").map(function(p){ return p.trim();
         }
         if (fProtos.indexOf("vless") < 0 && fProtos.indexOf("trojan") < 0) fProtos = ["vless"];
         var _m = String(_fj.mode || "").toLowerCase();
-        if (_m === "default" || _m === "normal") {
-          fragQ = "&fragment=" + encodeURIComponent("tlshello,100-200,1-1,100-200");
+        if (_m === "default" || _m === "normal" || _fj.fragment === false) {
+          fragQ = "";
         } else if (_m === "trex" || _m === "flux" || _fj.dual || _fj.packets2) {
           fragQ = "&fragment=" + encodeURIComponent("tlshello,5,94,1,0") + "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
         }
