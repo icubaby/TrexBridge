@@ -1012,39 +1012,69 @@ const Router = {
 					return { live, ms: Math.max(1, Date.now() - t0) };
 				}
 
+				function pushCand(out, seen, proxy, country, city, apiTo, protocol) {
+					let p = String(proxy || "").trim();
+					if (!p) return;
+					if (!/^(socks5|socks4|http|https):\/\//i.test(p)) {
+						const proto = String(protocol || "socks5").toLowerCase();
+						p = (/socks5|socks4|http|https/i.test(proto) ? proto : "socks5") + "://" + p;
+					}
+					const key = p.toLowerCase();
+					if (seen.has(key)) return;
+					seen.add(key);
+					out.push({
+						proxy: p,
+						country: String(country || "").trim().toUpperCase(),
+						city: String(city || "").trim(),
+						apiTo: typeof apiTo === "number" ? apiTo : 99999,
+						protocol: String(protocol || p).toLowerCase(),
+					});
+				}
+
 				function parseRows(arr) {
 					const out = [];
 					const seen = new Set();
 					for (let li = 0; li < (arr || []).length; li++) {
 						const row = arr[li];
-						if (!row || typeof row !== "object") continue;
+						if (!row) continue;
+						if (typeof row === "string") {
+							pushCand(out, seen, row, "", "", 99999, "");
+							continue;
+						}
+						if (typeof row !== "object") continue;
 						if (row.alive === false) continue;
 						let proxy = String(row.proxy || "").trim();
 						if (!proxy) {
 							const ip = row.ip || row.host;
 							const port = row.port;
-							const proto = String(row.protocol || "socks5").toLowerCase();
+							let proto = row.protocol || row.protocols;
+							if (Array.isArray(proto)) proto = proto[0] || "socks5";
+							proto = String(proto || "socks5").toLowerCase();
 							if (ip && port) proxy = proto + "://" + ip + ":" + port;
 						}
-						if (!proxy) continue;
-						if (!/^(socks5|socks4|http|https):\/\//i.test(proxy)) {
-							const proto = String(row.protocol || "socks5").toLowerCase();
-							proxy = (/socks5|socks4|http|https/i.test(proto) ? proto : "socks5") + "://" + proxy;
-						}
-						// prefer socks5 for Worker exit
-						if (!/socks5/i.test(proxy) && !/socks5/i.test(String(row.protocol || ""))) {
-							// still allow socks4/http but rank lower later
-						}
-						const key = proxy.toLowerCase();
-						if (seen.has(key)) continue;
-						seen.add(key);
 						const ipData = row.ip_data && typeof row.ip_data === "object" ? row.ip_data : {};
-						const country = String(ipData.countryCode || ipData.country_code || row.countryCode || row.country || "")
+						const geo = row.geolocation && typeof row.geolocation === "object" ? row.geolocation : {};
+						const country = String(
+							ipData.countryCode ||
+								ipData.country_code ||
+								geo.country ||
+								row.countryCode ||
+								row.country_code ||
+								row.country ||
+								"",
+						)
 							.trim()
 							.toUpperCase();
-						const city = String(ipData.city || row.city || "").trim();
-						const apiTo = typeof row.timeout === "number" ? row.timeout : typeof row.average_timeout === "number" ? row.average_timeout : 99999;
-						out.push({ proxy, country, city, apiTo, protocol: String(row.protocol || "").toLowerCase() });
+						const city = String(ipData.city || geo.city || row.city || "").trim();
+						const apiTo =
+							typeof row.timeout === "number"
+								? row.timeout
+								: typeof row.average_timeout === "number"
+									? row.average_timeout
+									: 99999;
+						let protocol = row.protocol || row.protocols || "";
+						if (Array.isArray(protocol)) protocol = protocol[0] || "";
+						pushCand(out, seen, proxy, country, city, apiTo, protocol);
 					}
 					out.sort(function (a, b) {
 						const ra = /socks5/.test(a.protocol || a.proxy) ? 0 : 1;
@@ -1055,36 +1085,98 @@ const Router = {
 					return out;
 				}
 
+				function parseTextList(text) {
+					const lines = String(text || "")
+						.split(/\r?\n/)
+						.map((l) => l.trim())
+						.filter((l) => l.length > 5);
+					return parseRows(lines);
+				}
+
+				async function loadProxyPool(countryCode) {
+					const cc = String(countryCode || "").toLowerCase();
+					const sources = [];
+					if (cc) {
+						sources.push(
+							"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&country=" +
+								encodeURIComponent(cc) +
+								"&limit=40&_=" +
+								now,
+						);
+						sources.push(
+							"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=socks5&country=" +
+								encodeURIComponent(cc) +
+								"&timeout=2000&_=" +
+								now,
+						);
+					} else {
+						sources.push(
+							"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&limit=80&_=" +
+								now,
+						);
+						sources.push(
+							"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=socks5&timeout=2000&_=" +
+								now,
+						);
+					}
+					sources.push("https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json?t=" + now);
+					sources.push("https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.json?t=" + now);
+					sources.push("https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/all.json?t=" + now);
+
+					for (let si = 0; si < sources.length; si++) {
+						try {
+							const res = await fetch(sources[si], {
+								headers: { Accept: "application/json,text/plain,*/*", "User-Agent": "Mozilla/5.0" },
+							});
+							if (!res.ok) continue;
+							const ctype = (res.headers.get("content-type") || "").toLowerCase();
+							let pool = [];
+							if (ctype.includes("json") || sources[si].includes("format=json") || sources[si].includes(".json")) {
+								let data;
+								try {
+									data = await res.json();
+								} catch (_) {
+									continue;
+								}
+								const arr = Array.isArray(data)
+									? data
+									: Array.isArray(data && data.proxies)
+										? data.proxies
+										: [];
+								pool = parseRows(arr);
+							} else {
+								const text = await res.text();
+								pool = parseTextList(text);
+							}
+							if (cc) {
+								const up = cc.toUpperCase();
+								const filtered = pool.filter((p) => !p.country || p.country === up);
+								if (filtered.length) pool = filtered;
+							}
+							if (pool.length) return pool;
+						} catch (_) {}
+					}
+					return [];
+				}
+
 				if (wantCountry) {
-					const SRC =
-						"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&country=" +
-						encodeURIComponent(wantCountry) +
-						"&limit=25";
-					const res = await fetch(SRC + "&_=" + now, {
-						headers: { Accept: "application/json,*/*", "User-Agent": "Mozilla/5.0" },
-					});
-					if (!res.ok) {
-						return new Response(JSON.stringify({ error: "Proxy source error" }), {
-							status: 502,
-							headers: { "Content-Type": "application/json; charset=utf-8" },
-						});
+					const pool = await loadProxyPool(wantCountry);
+					if (!pool.length) {
+						return new Response(
+							JSON.stringify({
+								error: "Proxy source error",
+								detail: "No list for " + wantCountry.toUpperCase(),
+								country: wantCountry.toUpperCase(),
+							}),
+							{ status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } },
+						);
 					}
-					let data;
-					try {
-						data = await res.json();
-					} catch (_) {
-						return new Response(JSON.stringify({ error: "Bad proxy JSON" }), {
-							status: 502,
-							headers: { "Content-Type": "application/json; charset=utf-8" },
-						});
-					}
-					const arr = Array.isArray(data) ? data : Array.isArray(data && data.proxies) ? data.proxies : [];
-					const pool = parseRows(arr);
-					const maxTry = Math.min(2, pool.length);
+					const maxTry = Math.min(3, pool.length);
 					let tried = 0;
 					for (let ti = 0; ti < maxTry; ti++) {
 						tried++;
 						const cand = pool[ti];
+						if (!cand || !cand.proxy) continue;
 						const r = await pingOne(cand.proxy);
 						if (!r.live) continue;
 						return new Response(
@@ -1098,7 +1190,7 @@ const Router = {
 								tried: tried,
 								source: "country",
 							}),
-							{ headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }
+							{ headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } },
 						);
 					}
 					return new Response(
@@ -1108,37 +1200,15 @@ const Router = {
 							tried: tried,
 							country: wantCountry.toUpperCase(),
 						}),
-						{ status: 404, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }
+						{ status: 404, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } },
 					);
 				}
 
-				// Random: cache list, try up to 5 sequential pings max when find=1, else 1
-				const SRC =
-					"https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&limit=80";
 				if (!state.proxyCursor.list.length || now - state.proxyCursor.fetchedAt > 180000) {
-					const res = await fetch(SRC + (SRC.includes("?") ? "&" : "?") + "_=" + now, {
-						headers: { Accept: "application/json,*/*", "User-Agent": "Mozilla/5.0" },
-					});
-					if (!res.ok) {
-						return new Response(JSON.stringify({ error: "Proxy source error" }), {
-							status: 502,
-							headers: { "Content-Type": "application/json; charset=utf-8" },
-						});
-					}
-					let data;
-					try {
-						data = await res.json();
-					} catch (_) {
-						return new Response(JSON.stringify({ error: "Bad proxy JSON" }), {
-							status: 502,
-							headers: { "Content-Type": "application/json; charset=utf-8" },
-						});
-					}
-					const arr = Array.isArray(data) ? data : Array.isArray(data && data.proxies) ? data.proxies : [];
-					const candidates = parseRows(arr);
+					const candidates = await loadProxyPool("");
 					if (!candidates.length) {
-						return new Response(JSON.stringify({ error: "No proxies from source" }), {
-							status: 404,
+						return new Response(JSON.stringify({ error: "Proxy source error", detail: "All sources failed" }), {
+							status: 502,
 							headers: { "Content-Type": "application/json; charset=utf-8" },
 						});
 					}
@@ -1152,7 +1222,7 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-				const maxTry = findLive ? Math.min(2, n) : 1;
+				const maxTry = findLive ? Math.min(3, n) : 1;
 				let tried = 0;
 				const startIdx = ((state.proxyCursor.at % n) + n) % n;
 				for (let k = 0; k < maxTry; k++) {
@@ -1177,7 +1247,7 @@ const Router = {
 							total: n,
 							source: "random",
 						}),
-						{ headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }
+						{ headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } },
 					);
 				}
 				return new Response(
@@ -1190,7 +1260,7 @@ const Router = {
 						next: state.proxyCursor.at,
 						total: n,
 					}),
-					{ status: 404, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } }
+					{ status: 404, headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } },
 				);
 			} catch (e) {
 				return new Response(JSON.stringify({ error: "Random failed", detail: String((e && e.message) || e) }), {
@@ -2275,9 +2345,10 @@ function getSelectedUserProxy(userSocks5, request) {
 const PROXIFLY_ALL_URL = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json";
 const PROXIFLY_ALL_URL_GH = "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.json";
 const EXIT_PROXY_SOURCES = [
-	{ name: "ProxyScrape", key: "proxyscrape", url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&timeout=1000", type: "text" },
+	{ name: "ProxyScrape", key: "proxyscrape", url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json&protocol=socks5&timeout=2000&limit=100", type: "proxyscrape" },
+	{ name: "ProxyScrapeText", key: "proxyscrape_text", url: "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text&protocol=socks5&timeout=2000", type: "text" },
+	{ name: "Proxifly", key: "proxifly", url: "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json", type: "json" },
 	{ name: "HProxy", key: "hproxy", url: "https://raw.githubusercontent.com/hproxy-com/free-proxy-list/main/all.json", type: "json" },
-	{ name: "Databay", key: "databay", url: "https://databay.com/api/v1/proxy-list", type: "json" },
 ];
 const EXIT_PING_CACHE_MS = 8 * 60 * 1000;
 let _exitPingCache = {}; // { [cc]: { at, proxies } }
@@ -2340,20 +2411,27 @@ function parseExitProxiflyItem(item) {
 	let country = "";
 	if (item.geolocation && item.geolocation.country) {
 		const c = item.geolocation.country;
-		country = String(typeof c === "object" ? (c.iso_code || c) : c).toUpperCase();
+		country = String(typeof c === "object" ? (c.iso_code || c.code || c) : c).toUpperCase();
 	}
+	if (!country && item.countryCode) country = String(item.countryCode).toUpperCase();
+	if (!country && item.country_code) country = String(item.country_code).toUpperCase();
+	if (!country && item.country) country = String(item.country).toUpperCase().slice(0, 2);
 	if (item.proxy) {
 		const p = parseExitTextLine(item.proxy, "proxifly");
 		if (p) {
-			p.country = country;
-			if (item.protocol) p.protocol = String(item.protocol).toLowerCase();
+			p.country = country || p.country;
+			let proto = item.protocol || item.protocols;
+			if (Array.isArray(proto)) proto = proto[0];
+			if (proto) p.protocol = String(proto).toLowerCase();
 			return p;
 		}
 	}
 	const host = String(item.ip || item.host || "").trim();
 	const port = parseInt(item.port, 10);
 	if (!host || !port || host.includes(":")) return null;
-	const protocol = String(item.protocol || "socks5").toLowerCase();
+	let protocol = item.protocol || item.protocols || "socks5";
+	if (Array.isArray(protocol)) protocol = protocol[0] || "socks5";
+	protocol = String(protocol || "socks5").toLowerCase();
 	return {
 		key: host + ":" + port,
 		host,
