@@ -445,6 +445,7 @@ async function checkAutoRotates(env, ctx) {
 let cachedVipCountries = [];
 let lastVipCountriesFetch = 0;
 async function replaceBrokenProxy(username, env, oldProxy) {
+	return;
 	try {
 		if (state.writeLock.get(username + "_proxy_rotate")) return;
 		state.writeLock.set(username + "_proxy_rotate", true);
@@ -1079,7 +1080,7 @@ const Router = {
 					}
 					const arr = Array.isArray(data) ? data : Array.isArray(data && data.proxies) ? data.proxies : [];
 					const pool = parseRows(arr);
-					const maxTry = Math.min(4, pool.length);
+					const maxTry = Math.min(2, pool.length);
 					let tried = 0;
 					for (let ti = 0; ti < maxTry; ti++) {
 						tried++;
@@ -1151,7 +1152,7 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-				const maxTry = findLive ? Math.min(5, n) : 1;
+				const maxTry = findLive ? Math.min(2, n) : 1;
 				let tried = 0;
 				const startIdx = ((state.proxyCursor.at % n) + n) % n;
 				for (let k = 0; k < maxTry; k++) {
@@ -1663,7 +1664,7 @@ const Router = {
 				const cc = (url.searchParams.get("cc") || "").trim().toUpperCase();
 				if (!cc) return new Response(JSON.stringify({ ok: false, error: "cc required" }), { status: 400, headers: { "Content-Type": "application/json" } });
 				const force = url.searchParams.get("force") === "1";
-				const proxies = await buildExitProxiesForCountry(cc, 36, 12, force);
+				const proxies = await buildExitProxiesForCountry(cc, 6, 2, force);
 				const cached = _exitPingCache[cc];
 				const cachedAge = cached ? Date.now() - cached.at : null;
 				return new Response(JSON.stringify({
@@ -2565,34 +2566,20 @@ function isExitSocks(proto) {
 	const p = String(proto || "").toLowerCase();
 	return p.includes("socks");
 }
-async function buildExitProxiesForCountry(cc, maxTest = 40, topN = 12, force = false) {
+async function buildExitProxiesForCountry(cc, maxTest = 6, topN = 2, force = false) {
 	cc = String(cc || "").toUpperCase();
 	if (!cc) return [];
 	const cached = _exitPingCache[cc];
 	if (!force && cached && cached.proxies && cached.proxies.length && Date.now() - cached.at < EXIT_PING_CACHE_MS) {
 		return cached.proxies.slice(0, topN);
 	}
-	let list = await fetchExitProxyUniverse(30);
-	let matched = list.filter((p) => (p.country || "").toUpperCase() === cc);
-	if (matched.length < 6) {
-		const unknown = list.filter((p) => !p.country && /^\d+\.\d+\.\d+\.\d+$/.test(String(p.host || "")));
-		for (let i = unknown.length - 1; i > 0; i--) {
-			const j = Math.floor(Math.random() * (i + 1));
-			const t = unknown[i];
-			unknown[i] = unknown[j];
-			unknown[j] = t;
-		}
-		await Promise.all(
-			unknown.slice(0, 16).map(async (p) => {
-				try {
-					const g = await lookupExitCountry(p.host);
-					if (g) p.country = g;
-				} catch (e) {}
-			}),
-		);
-		matched = list.filter((p) => (p.country || "").toUpperCase() === cc);
+	let list = [];
+	try {
+		list = await fetchExitProxyUniverse(15);
+	} catch (e) {
+		return [];
 	}
-	// Sample: mix SOCKS + HTTP, shuffle for variety
+	let matched = list.filter((p) => (p.country || "").toUpperCase() === cc);
 	const socks = matched.filter((p) => isExitSocks(p.protocol));
 	const httpOnly = matched.filter((p) => !isExitSocks(p.protocol));
 	function shuffle(arr) {
@@ -2607,63 +2594,42 @@ async function buildExitProxiesForCountry(cc, maxTest = 40, topN = 12, force = f
 	shuffle(socks);
 	shuffle(httpOnly);
 	const sample = [];
-	// Prefer more SOCKS in sample but keep some HTTP
+	const cap = Math.min(Math.max(1, maxTest), 6);
 	for (const p of socks) {
-		if (sample.length >= Math.min(maxTest, 32)) break;
+		if (sample.length >= cap) break;
 		sample.push(p);
 	}
 	for (const p of httpOnly) {
-		if (sample.length >= maxTest) break;
+		if (sample.length >= cap) break;
 		sample.push(p);
 	}
-	// Phase 1: fast TCP open ping (parallel)
-	const tcpHits = [];
-	const concurrency = 18;
-	let idx = 0;
-	async function tcpWorker() {
-		while (idx < sample.length) {
-			const i = idx++;
-			const item = sample[i];
-			if (!item || !item.host || !item.port) continue;
-			const ping = await tcpPingExit(item.host, item.port, 1100);
-			if (ping == null) continue;
-			const proxy = item.proxy || normalizeProxyUrl(item.host + ":" + item.port, item.protocol);
-			if (!proxy) continue;
-			tcpHits.push({
-				proxy,
-				host: item.host,
-				port: item.port,
-				protocol: item.protocol,
-				country: cc,
-				countryName: cc,
-				source: item.source,
-				ping,
-				verified: false,
-			});
-		}
-	}
-	await Promise.all(Array.from({ length: Math.min(concurrency, Math.max(sample.length, 1)) }, () => tcpWorker()));
-	// Lowest ping first (what user cares about)
-	tcpHits.sort((a, b) => a.ping - b.ping);
-	// Phase 2: verify CONNECT through proxy on the fastest candidates
-	const verifyN = Math.min(tcpHits.length, Math.max(topN * 2, 16));
-	const toVerify = tcpHits.slice(0, verifyN);
 	const verified = [];
-	let vIdx = 0;
-	async function verifyWorker() {
-		while (vIdx < toVerify.length) {
-			const i = vIdx++;
-			const item = toVerify[i];
-			const ok = await isProxyLive(item.proxy, 800);
-			if (!ok) continue;
-			item.verified = true;
-			verified.push(item);
+	for (let i = 0; i < sample.length && verified.length < topN; i++) {
+		const item = sample[i];
+		if (!item || !item.host || !item.port) continue;
+		const proxy = item.proxy || normalizeProxyUrl(item.host + ":" + item.port, item.protocol);
+		if (!proxy) continue;
+		const t0 = Date.now();
+		let ok = false;
+		try {
+			ok = await isProxyLive(proxy, 900);
+		} catch (e) {
+			ok = false;
 		}
+		if (!ok) continue;
+		verified.push({
+			proxy,
+			host: item.host,
+			port: item.port,
+			protocol: item.protocol,
+			country: cc,
+			countryName: cc,
+			source: item.source,
+			ping: Math.max(1, Date.now() - t0),
+			verified: true,
+		});
 	}
-	await Promise.all(Array.from({ length: Math.min(10, toVerify.length || 1) }, () => verifyWorker()));
-	verified.sort((a, b) => a.ping - b.ping);
-	// Prefer verified; if none, fall back to TCP-only lowest ping (still usable sometimes)
-	let top = verified.length ? verified.slice(0, topN) : tcpHits.slice(0, topN);
+	let top = verified.slice(0, topN);
 	// Soft prefer SOCKS among same ping band: stable secondary key
 	top.sort((a, b) => {
 		if (a.ping !== b.ping) return a.ping - b.ping;
@@ -2686,7 +2652,7 @@ async function testProxyTcpOpen(host, port, timeoutMs = 2000) {
 		return false;
 	}
 }
-async function pickRandomExitProxy(maxTry = 24) {
+async function pickRandomExitProxy(maxTry = 2) {
 	const list = await fetchExitProxyUniverse(25);
 	if (!list.length) return null;
 	const socks5 = list.filter((p) => String(p.protocol || "").toLowerCase().includes("socks5"));
@@ -2815,12 +2781,11 @@ async function isProxyLive(proxyUrl, timeoutMs = 900) {
 		return false;
 	}
 }
-async function pickProxiflyProxy(countryCode, maxTest = 8) {
+async function pickProxiflyProxy(countryCode, maxTest = 2) {
 	const cc = String(countryCode || "").trim().toUpperCase();
 	if (!cc || cc === "OFF" || cc === "NONE" || cc === "CF" || cc === "AUTO") return "";
-	// Lowest-ping verified proxies for this country
 	try {
-		const ranked = await buildExitProxiesForCountry(cc, Math.max(maxTest * 3, 24), maxTest, false);
+		const ranked = await buildExitProxiesForCountry(cc, 4, 1, false);
 		if (ranked.length) return ranked[0].proxy;
 	} catch (e) {}
 	const list = await fetchProxiflyList();
@@ -2845,7 +2810,7 @@ async function pickProxiflyProxy(countryCode, maxTest = 8) {
 		matched[i] = matched[j];
 		matched[j] = t;
 	}
-	const tryCount = Math.min(maxTest, matched.length);
+	const tryCount = Math.min(Math.max(1, maxTest), 2, matched.length);
 	for (let i = 0; i < tryCount; i++) {
 		const item = matched[i];
 		let proxy = item.proxy || (item.ip + ":" + item.port);
@@ -2856,21 +2821,11 @@ async function pickProxiflyProxy(countryCode, maxTest = 8) {
 	}
 	return "";
 }
-async function resolveUserProxy(user, request) {
-	// Locked manual proxy stays until dead (caller rotates via replaceBrokenProxy / retry)
-	const manual = getSelectedUserProxy(user?.user_socks5, request);
-	if (manual) return manual;
-	const cc = (user?.user_proxy_iata || "").trim();
-	if (cc) return await pickProxiflyProxy(cc, 8);
-	return "";
+function resolveUserProxy(user, request) {
+	return getSelectedUserProxy(user && user.user_socks5, request) || "";
 }
 function userHasExitLock(user) {
-	// Hard lock only for country-IATA mode WITHOUT a fixed socks URL.
-	// Random free proxies are stored in user_socks5 and must soft-fallback when dead.
-	const socks = (user && user.user_socks5) ? String(user.user_socks5).trim() : "";
-	if (socks) return false;
-	const cc = (user?.user_proxy_iata || "").trim().toUpperCase();
-	return !!(cc && cc !== "OFF" && cc !== "NONE" && cc !== "CF" && cc !== "AUTO");
+	return !!(user && user.user_socks5 && String(user.user_socks5).trim());
 }
 async function handleVless(env, _unused = null, ctx = null, request = null) {
 	try {
@@ -3377,70 +3332,45 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 							if (resolvedRecord && resolvedRecord.data) addr = resolvedRecord.data;
 						} catch (e) {}
 					}
-					const connectTCP = async (dataPayload = null) => {
+					const openRemote = async (payload = null) => {
 						if (remoteConnWrapper.connectingPromise) {
 							await remoteConnWrapper.connectingPromise;
 							return;
 						}
-						const task = (async () => {
-							let s = null;
-							const exitLocked = userHasExitLock(user);
-							const socks5 = await resolveUserProxy(user, request);
-							if (exitLocked) {
-								// Location locked: try lowest-ping proxies for this country (never direct CF)
-								const tried = new Set();
-								let lastErr = null;
-								const tryList = [];
-								if (socks5) tryList.push(socks5);
+						const job = (async () => {
+							let sock = null;
+							const exitProxy = resolveUserProxy(user, request);
+							if (exitProxy) {
 								try {
-									const ranked = await buildExitProxiesForCountry(String(user.user_proxy_iata || "").toUpperCase(), 24, 8, false);
-									for (const r of ranked) {
-										if (r && r.proxy) tryList.push(r.proxy);
-									}
-								} catch (e) {}
-								try {
-									const extra = await pickProxiflyProxy(user.user_proxy_iata, 6);
-									if (extra) tryList.push(extra);
-								} catch (e) {}
-								for (const pxy of tryList) {
-									if (!pxy || tried.has(pxy)) continue;
-									tried.add(pxy);
-									try {
-										s = await connectProxy(pxy, addr, port, dataPayload);
-										lastErr = null;
-										break;
-									} catch (e) {
-										lastErr = e;
-									}
-								}
-								if (!s) throw lastErr || new Error("exit_proxy_unavailable");
-							} else if (socks5) {
-								try {
-									s = await connectProxy(socks5, addr, port, dataPayload);
-								} catch (proxyErr) {
-									if (user.auto_rotate_user_proxy === 1) {
-										const replaceTask = replaceBrokenProxy(user.username, env, socks5);
-										if (ctx) ctx.waitUntil(replaceTask);
-										else replaceTask.catch(() => {});
-									}
-									// Fallback to direct so a dead manual proxy does not kill all pings
-									s = await connectDirect(addr, port, dataPayload, targetDoh);
+									sock = await connectProxy(exitProxy, addr, port, payload);
+								} catch (err) {
+									try { serverSock.close(); } catch (_) {}
+									return;
 								}
 							} else {
-								s = await connectDirect(addr, port, dataPayload, targetDoh);
+								try {
+									sock = await connectDirect(addr, port, payload, targetDoh);
+								} catch (err) {
+									try { serverSock.close(); } catch (_) {}
+									return;
+								}
 							}
-							remoteConnWrapper.socket = s;
-							s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-							connectStreams(s, serverSock, respHeader, null, addBytes);
+							if (!sock) {
+								try { serverSock.close(); } catch (_) {}
+								return;
+							}
+							remoteConnWrapper.socket = sock;
+							sock.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+							connectStreams(sock, serverSock, respHeader, null, addBytes);
 						})();
-						remoteConnWrapper.connectingPromise = task;
-						try { await task; }
+						remoteConnWrapper.connectingPromise = job;
+						try { await job; }
 						finally {
-							if (remoteConnWrapper.connectingPromise === task) remoteConnWrapper.connectingPromise = null;
+							if (remoteConnWrapper.connectingPromise === job) remoteConnWrapper.connectingPromise = null;
 						}
 					};
-					remoteConnWrapper.retryConnect = async () => connectTCP(null);
-					await connectTCP(rawData);
+					remoteConnWrapper.retryConnect = async () => openRemote(null);
+					await openRemote(rawData);
 				} catch (e) {
 					serverSock.close();
 				}
@@ -3659,73 +3589,48 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					serverSock.close();
 					return;
 				}
-				const connectTCP = async (dataPayload = null, useFallback = true) => {
+				const openRemote = async (payload = null) => {
 					if (remoteConnWrapper.connectingPromise) {
 						await remoteConnWrapper.connectingPromise;
 						return;
 					}
-					const task = (async () => {
-						let s = null;
-							const exitLocked = userHasExitLock(user);
-							const socks5 = await resolveUserProxy(user, request);
-							if (exitLocked) {
-								// Location locked: try lowest-ping proxies for this country (never direct CF)
-								const tried = new Set();
-								let lastErr = null;
-								const tryList = [];
-								if (socks5) tryList.push(socks5);
-								try {
-									const ranked = await buildExitProxiesForCountry(String(user.user_proxy_iata || "").toUpperCase(), 24, 8, false);
-									for (const r of ranked) {
-										if (r && r.proxy) tryList.push(r.proxy);
-									}
-								} catch (e) {}
-								try {
-									const extra = await pickProxiflyProxy(user.user_proxy_iata, 6);
-									if (extra) tryList.push(extra);
-								} catch (e) {}
-								for (const pxy of tryList) {
-									if (!pxy || tried.has(pxy)) continue;
-									tried.add(pxy);
-									try {
-										s = await connectProxy(pxy, addr, port, dataPayload);
-										lastErr = null;
-										break;
-									} catch (e) {
-										lastErr = e;
-									}
-								}
-								if (!s) throw lastErr || new Error("exit_proxy_unavailable");
-							} else if (socks5) {
-								try {
-									s = await connectProxy(socks5, addr, port, dataPayload);
-								} catch (proxyErr) {
-									if (user.auto_rotate_user_proxy === 1) {
-										const replaceTask = replaceBrokenProxy(user.username, env, socks5);
-										if (ctx) ctx.waitUntil(replaceTask);
-										else replaceTask.catch(() => {});
-									}
-									// Fallback to direct so a dead manual proxy does not kill all pings
-									s = await connectDirect(addr, port, dataPayload, targetDoh);
-								}
-							} else {
-								s = await connectDirect(addr, port, dataPayload, targetDoh);
+					const job = (async () => {
+						let sock = null;
+						const exitProxy = resolveUserProxy(user, request);
+						if (exitProxy) {
+							try {
+								sock = await connectProxy(exitProxy, addr, port, payload);
+							} catch (err) {
+								try { serverSock.close(); } catch (_) {}
+								return;
 							}
-						remoteConnWrapper.socket = s;
-						s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-						connectStreams(s, serverSock, respHeader, null, addBytes);
+						} else {
+							try {
+								sock = await connectDirect(addr, port, payload, targetDoh);
+							} catch (err) {
+								try { serverSock.close(); } catch (_) {}
+								return;
+							}
+						}
+						if (!sock) {
+							try { serverSock.close(); } catch (_) {}
+							return;
+						}
+						remoteConnWrapper.socket = sock;
+						sock.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+						connectStreams(sock, serverSock, respHeader, null, addBytes);
 					})();
-					remoteConnWrapper.connectingPromise = task;
+					remoteConnWrapper.connectingPromise = job;
 					try {
-						await task;
+						await job;
 					} finally {
-						if (remoteConnWrapper.connectingPromise === task) {
+						if (remoteConnWrapper.connectingPromise === job) {
 							remoteConnWrapper.connectingPromise = null;
 						}
 					}
 				};
-				remoteConnWrapper.retryConnect = async () => connectTCP(null, false);
-				await connectTCP(rawData, true);
+				remoteConnWrapper.retryConnect = async () => openRemote(null);
+				await openRemote(rawData);
 			} catch (e) {
 				serverSock.close();
 			}
@@ -7998,7 +7903,7 @@ function CreateView({
         ip_operator: ipOperator || "all",
         user_socks5: exitProxy.trim() ? (exitCountry ? JSON.stringify([{ proxy: exitProxy.trim(), country: String(exitCountry).toUpperCase() }]) : exitProxy.trim()) : null,
         user_proxy_iata: null,
-        auto_rotate_user_proxy: exitProxy.trim() ? 1 : 0
+        auto_rotate_user_proxy: 0
       };
       const isEdit = !!(editUser && editUser.username);
       const res = await fetch(isEdit ? "/api/users/" + encodeURIComponent(editUser.username) : "/api/users", {
