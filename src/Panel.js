@@ -2969,34 +2969,27 @@ async function connectProxyTimed(proxyStr, destAddr, destPort, initialData, time
 function attachRemoteSocket(sock, serverSock, respHeader, addBytes) {
 	if (!sock) {
 		try {
-			serverSock.close();
+			closeSocketQuietly(serverSock);
 		} catch (_) {}
 		return;
 	}
 	try {
-		if (sock.closed && typeof sock.closed.then === "function") {
-			sock.closed.catch(() => {}).finally(() => {
-				try {
-					closeSocketQuietly(serverSock);
-				} catch (_) {}
-			});
-		}
-	} catch (_) {}
-	try {
 		const streamJob = connectStreams(sock, serverSock, respHeader, null, addBytes);
-		if (streamJob && typeof streamJob.then === "function") {
-			streamJob.catch(() => {
-				try {
-					closeSocketQuietly(serverSock);
-				} catch (_) {}
-				try {
-					sock.close();
-				} catch (_) {}
-			});
+		if (streamJob && typeof streamJob.finally === "function") {
+			streamJob
+				.catch(() => {})
+				.finally(() => {
+					try {
+						closeSocketQuietly(serverSock);
+					} catch (_) {}
+					try {
+						sock.close();
+					} catch (_) {}
+				});
 		}
 	} catch (_) {
 		try {
-			serverSock.close();
+			closeSocketQuietly(serverSock);
 		} catch (e2) {}
 		try {
 			sock.close();
@@ -3070,8 +3063,8 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 		if (state.writeLock.get(username)) return;
 		let lastDbWrite = state.lastWrite.get(username) || 0;
 		let now = Date.now();
-		let thresholdBytes = 500 * 1024 * 1024;
-		if ((current >= thresholdBytes && now - lastDbWrite > 180000) || (current > 0 && now - lastDbWrite > 900000)) {
+		let thresholdBytes = 100 * 1024 * 1024;
+		if ((current >= thresholdBytes && now - lastDbWrite > 20000) || (current > 0 && now - lastDbWrite > 120000)) {
 			state.writeLock.set(username, true);
 			let toCommit = state.traffic.get(username) || 0;
 			let toCommitReq = state.reqCache.get(username) || 0;
@@ -3124,8 +3117,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 			let cachedReqs = state.reqCache.get(uname) || 0;
 			let nowOff = Date.now();
 			let lastWrite = state.lastWrite.get(uname) || 0;
-			let shouldCommit = (cachedBytes >= 20 * 1024 * 1024) || (nowOff - lastWrite > 600000) || (cachedReqs >= 20);
-			if (shouldCommit && (cachedBytes > 0 || cachedReqs > 0) && !state.writeLock.get(uname)) {
+			if ((cachedBytes > 0 || cachedReqs > 0) && !state.writeLock.get(uname)) {
 				state.writeLock.set(uname, true);
 				state.lastWrite.set(uname, nowOff);
 				state.traffic.set(uname, (state.traffic.get(uname) || 0) - cachedBytes);
@@ -3521,40 +3513,45 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					}
 					const openRemote = async (payload = null) => {
 						if (remoteConnWrapper.connectingPromise) {
-							try {
-								await remoteConnWrapper.connectingPromise;
-							} catch (_) {}
+							try { await remoteConnWrapper.connectingPromise; } catch (_) {}
 							return;
 						}
 						const job = (async () => {
-							let sock = null;
+							let s = null;
+							const socks5 = resolveUserProxy(user, request);
+							if (socks5) {
+								try {
+									s = await connectProxy(socks5, addr, port, payload);
+								} catch (proxyErr) {
+									try {
+										s = await connectDirect(addr, port, payload, targetDoh);
+									} catch (_) {
+										throw proxyErr;
+									}
+								}
+							} else {
+								s = await connectDirect(addr, port, payload, targetDoh);
+							}
+							if (!s) return;
+							remoteConnWrapper.socket = s;
 							try {
-								const exitProxy = resolveUserProxy(user, request);
-								if (exitProxy) {
-									sock = await connectProxyTimed(exitProxy, addr, port, payload, 8000);
-								} else {
-									sock = await connectDirect(addr, port, payload, targetDoh);
+								if (s.closed && typeof s.closed.then === "function") {
+									s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+								}
+							} catch (_) {}
+							try {
+								const streamJob = connectStreams(s, serverSock, respHeader, null, addBytes);
+								if (streamJob && typeof streamJob.catch === "function") {
+									streamJob.catch(() => closeSocketQuietly(serverSock));
 								}
 							} catch (_) {
-								try {
-									serverSock.close();
-								} catch (e2) {}
-								return;
+								closeSocketQuietly(serverSock);
 							}
-							if (!sock) {
-								try {
-									serverSock.close();
-								} catch (_) {}
-								return;
-							}
-							remoteConnWrapper.socket = sock;
-							attachRemoteSocket(sock, serverSock, respHeader, addBytes);
 						})();
 						remoteConnWrapper.connectingPromise = job;
-						try {
-							await job;
-						} catch (_) {
-						} finally {
+						try { await job; }
+						catch (_) { try { serverSock.close(); } catch (e2) {} }
+						finally {
 							if (remoteConnWrapper.connectingPromise === job) remoteConnWrapper.connectingPromise = null;
 						}
 					};
@@ -3777,43 +3774,46 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 				}
 				const openRemote = async (payload = null) => {
 					if (remoteConnWrapper.connectingPromise) {
-						try {
-							await remoteConnWrapper.connectingPromise;
-						} catch (_) {}
+						try { await remoteConnWrapper.connectingPromise; } catch (_) {}
 						return;
 					}
 					const job = (async () => {
-						let sock = null;
+						let s = null;
+						const socks5 = resolveUserProxy(user, request);
+						if (socks5) {
+							try {
+								s = await connectProxy(socks5, addr, port, payload);
+							} catch (proxyErr) {
+								try {
+									s = await connectDirect(addr, port, payload, targetDoh);
+								} catch (_) {
+									throw proxyErr;
+								}
+							}
+						} else {
+							s = await connectDirect(addr, port, payload, targetDoh);
+						}
+						if (!s) return;
+						remoteConnWrapper.socket = s;
 						try {
-							const exitProxy = resolveUserProxy(user, request);
-							if (exitProxy) {
-								sock = await connectProxyTimed(exitProxy, addr, port, payload, 8000);
-							} else {
-								sock = await connectDirect(addr, port, payload, targetDoh);
+							if (s.closed && typeof s.closed.then === "function") {
+								s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+							}
+						} catch (_) {}
+						try {
+							const streamJob = connectStreams(s, serverSock, respHeader, null, addBytes);
+							if (streamJob && typeof streamJob.catch === "function") {
+								streamJob.catch(() => closeSocketQuietly(serverSock));
 							}
 						} catch (_) {
-							try {
-								serverSock.close();
-							} catch (e2) {}
-							return;
+							closeSocketQuietly(serverSock);
 						}
-						if (!sock) {
-							try {
-								serverSock.close();
-							} catch (_) {}
-							return;
-						}
-						remoteConnWrapper.socket = sock;
-						attachRemoteSocket(sock, serverSock, respHeader, addBytes);
 					})();
 					remoteConnWrapper.connectingPromise = job;
-					try {
-						await job;
-					} catch (_) {
-					} finally {
-						if (remoteConnWrapper.connectingPromise === job) {
-							remoteConnWrapper.connectingPromise = null;
-						}
+					try { await job; }
+					catch (_) { try { serverSock.close(); } catch (e2) {} }
+					finally {
+						if (remoteConnWrapper.connectingPromise === job) remoteConnWrapper.connectingPromise = null;
 					}
 				};
 				remoteConnWrapper.retryConnect = async () => openRemote(null);
@@ -4320,89 +4320,73 @@ async function waitForBackpressure(ws) {
 	}
 }
 async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, onBytes) {
-	let header = headerData,
-		hasData = false,
-		reader,
-		useBYOB = false;
-	const BYOB_LIMIT = 128 * 1024;
+	let header = headerData;
+	let hasData = false;
+	let reader = null;
+	if (!remoteSocket || !remoteSocket.readable) {
+		closeSocketQuietly(webSocket);
+		return;
+	}
 	const downstreamSender = createDownstreamSender(webSocket, header);
 	header = null;
 	try {
-		reader = remoteSocket.readable.getReader({ mode: "byob" });
-		useBYOB = true;
-	} catch (e) {
 		reader = remoteSocket.readable.getReader();
-	}
-	try {
-		if (!useBYOB) {
-			while (true) {
-				if (webSocket.bufferedAmount > 512 * 1024) await waitForBackpressure(webSocket);
-				const { done, value } = await reader.read();
-				if (done) break;
-				if (!value || value.byteLength === 0) continue;
-				hasData = true;
-				if (typeof onBytes === "function") onBytes(value.byteLength);
-				await downstreamSender.send(value);
-			}
-		} else {
-			let readBuffer = new ArrayBuffer(BYOB_LIMIT);
-			while (true) {
-				if (webSocket.bufferedAmount > 512 * 1024) await waitForBackpressure(webSocket);
-				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB_LIMIT));
-				if (done) break;
-				if (!value || value.byteLength === 0) continue;
-				hasData = true;
-				if (typeof onBytes === "function") onBytes(value.byteLength);
-				if (value.byteLength >= DOWNSTREAM_GRAIN) {
-					await downstreamSender.flush();
-					await downstreamSender.sendDirect(value);
-					readBuffer = new ArrayBuffer(BYOB_LIMIT);
-				} else {
-					await downstreamSender.send(value);
-					readBuffer = value.buffer.byteLength >= BYOB_LIMIT ? value.buffer : new ArrayBuffer(BYOB_LIMIT);
+		while (true) {
+			try {
+				if (webSocket && typeof webSocket.bufferedAmount === "number" && webSocket.bufferedAmount > 512 * 1024) {
+					await waitForBackpressure(webSocket);
 				}
+			} catch (_) {}
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value || value.byteLength === 0) continue;
+			hasData = true;
+			try {
+				if (typeof onBytes === "function") onBytes(value.byteLength);
+			} catch (_) {}
+			try {
+				await downstreamSender.send(value);
+			} catch (_) {
+				break;
 			}
 		}
-		await downstreamSender.flush();
+		try {
+			await downstreamSender.flush();
+		} catch (_) {}
 	} catch (err) {
 		closeSocketQuietly(webSocket);
 	} finally {
 		try {
-			reader.cancel();
+			if (reader) reader.cancel();
 		} catch (e) {}
 		try {
-			reader.releaseLock();
+			if (reader) reader.releaseLock();
 		} catch (e) {}
+		try {
+			closeSocketQuietly(webSocket);
+		} catch (_) {}
 	}
-	if (!hasData && retryFunc) await retryFunc();
+	if (!hasData && typeof retryFunc === "function") {
+		try {
+			await retryFunc();
+		} catch (_) {}
+	}
 }
 async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
-	let socket = null;
-	try {
-		socket = connect({ hostname: String(address || ""), port: Number(port) || 0 });
-		if (socket.opened && typeof socket.opened.then === "function") {
-			await Promise.race([
-				socket.opened,
-				new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 4000)),
-			]);
-		}
-		if (initialData && initialData.byteLength > 0) {
-			const w = socket.writable.getWriter();
-			try {
-				await w.write(convertToUint8Array(initialData));
-			} finally {
-				try {
-					w.releaseLock();
-				} catch (_) {}
-			}
-		}
-		return socket;
-	} catch (e) {
-		try {
-			if (socket) socket.close();
-		} catch (_) {}
-		throw e;
+	const host = String(address || "").trim();
+	const p = Number(port) || 0;
+	if (!host || p <= 0 || p > 65535) throw new Error("bad_target");
+	const socket = connect({ hostname: host, port: p });
+	await Promise.race([
+		socket.opened,
+		new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500)),
+	]);
+	if (initialData && initialData.byteLength > 0) {
+		const w = socket.writable.getWriter();
+		await w.write(convertToUint8Array(initialData));
+		w.releaseLock();
 	}
+	return socket;
 }
 async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServer = "8.8.4.4") {
 	const requestData = convertToUint8Array(udpChunk);
