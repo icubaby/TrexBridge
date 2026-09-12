@@ -152,7 +152,7 @@ function userPorts(user) {
 
 function fragOptions(user) {
   let protos = ["vless"];
-  let useFlux = true;
+  let useFlux = false;
   try {
     let raw = user && user.frag_len != null ? user.frag_len : "";
     if (raw && typeof raw === "object") {
@@ -164,13 +164,15 @@ function fragOptions(user) {
     }
     const s = String(raw || "").trim();
     if (s) {
-      let isDefault = false;
+      let isDefault = true;
       if (s.charAt(0) === "{") {
         try {
           const f = JSON.parse(s);
           if (f && typeof f === "object") {
             const mode = String(f.mode || "").toLowerCase();
-            if (mode === "default" || mode === "normal") isDefault = true;
+            if (mode === "default" || mode === "normal" || f.fragment === false) isDefault = true;
+            else if (mode === "trex" || mode === "flux" || f.dual === true || f.packets2) isDefault = false;
+            else isDefault = true;
             if (f.protocols) {
               protos = String(f.protocols)
                 .split(",")
@@ -181,12 +183,12 @@ function fragOptions(user) {
           }
         } catch (e2) {}
       } else if (
-        s.indexOf("default") >= 0 &&
-        s.indexOf("flux") < 0 &&
-        s.indexOf("trex") < 0 &&
-        s.indexOf("packets2") < 0
+        s.indexOf("flux") >= 0 ||
+        s.indexOf("trex") >= 0 ||
+        s.indexOf("packets2") >= 0 ||
+        s.indexOf("5,94,1") >= 0
       ) {
-        isDefault = true;
+        isDefault = false;
       }
       useFlux = !isDefault;
     }
@@ -1988,7 +1990,7 @@ const Router = {
 						const todayUtc = Math.floor(Date.now() / 86400000) * 86400000;
 						const nowTime = Date.now();
 						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob(String.fromCharCode(100,109,120,108,99,51,77,61)), tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, (frag_len !== undefined && frag_len !== null && String(frag_len).trim() !== "") ? (typeof frag_len === "object" ? JSON.stringify(frag_len) : String(frag_len)) : FLUX_JSON, frag_int !== undefined && frag_int !== null ? String(frag_int) : "", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0)
+							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, atob(String.fromCharCode(100,109,120,108,99,51,77,61)), tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, (frag_len !== undefined && frag_len !== null && String(frag_len).trim() !== "") ? (typeof frag_len === "object" ? JSON.stringify(frag_len) : String(frag_len)) : DEFAULT_FRAG_JSON, frag_int !== undefined && frag_int !== null ? String(frag_int) : "", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0)
 							.run();
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} catch (err) {
@@ -4332,27 +4334,17 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 	try {
 		reader = remoteSocket.readable.getReader();
 		while (true) {
-			try {
-				if (webSocket && typeof webSocket.bufferedAmount === "number" && webSocket.bufferedAmount > 512 * 1024) {
-					await waitForBackpressure(webSocket);
-				}
-			} catch (_) {}
+			if (webSocket && typeof webSocket.bufferedAmount === "number" && webSocket.bufferedAmount > 512 * 1024) {
+				await waitForBackpressure(webSocket);
+			}
 			const { done, value } = await reader.read();
 			if (done) break;
 			if (!value || value.byteLength === 0) continue;
 			hasData = true;
-			try {
-				if (typeof onBytes === "function") onBytes(value.byteLength);
-			} catch (_) {}
-			try {
-				await downstreamSender.send(value);
-			} catch (_) {
-				break;
-			}
+			if (typeof onBytes === "function") onBytes(value.byteLength);
+			await downstreamSender.send(value);
 		}
-		try {
-			await downstreamSender.flush();
-		} catch (_) {}
+		await downstreamSender.flush();
 	} catch (err) {
 		closeSocketQuietly(webSocket);
 	} finally {
@@ -4362,9 +4354,6 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 		try {
 			if (reader) reader.releaseLock();
 		} catch (e) {}
-		try {
-			closeSocketQuietly(webSocket);
-		} catch (_) {}
 	}
 	if (!hasData && typeof retryFunc === "function") {
 		try {
