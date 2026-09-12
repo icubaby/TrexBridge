@@ -18,9 +18,9 @@ const state = {
 const DNS_TTL_MS = 5 * 60 * 1000;
 const DNS_MAX = 2048;
 const DOH_URL = "https://cloudflare-dns.com/dns-query";
-const UPSTREAM_BUNDLE = 128 * 1024;
-const UPSTREAM_QUEUE_BYTES = 16 * 1024 * 1024;
-const UPSTREAM_QUEUE_ITEMS = 4096;
+const UPSTREAM_BUNDLE = 64 * 1024;
+const UPSTREAM_QUEUE_BYTES = 2 * 1024 * 1024;
+const UPSTREAM_QUEUE_ITEMS = 512;
 const DOWNSTREAM_GRAIN = 32 * 1024;
 const UTF8 = new TextEncoder();
 const FROM_UTF8 = new TextDecoder();
@@ -442,6 +442,34 @@ async function checkAutoRotates(env, ctx) {
 		}
 	} catch (e) {}
 }
+let localLastStateFlush = 0;
+async function periodicStateFlush(env, ctx) {
+	const now = Date.now();
+	if (now - localLastStateFlush < 45000) return;
+	localLastStateFlush = now;
+	try {
+		await flushExpiredTraffic(env);
+	} catch (e) {}
+	try {
+		if (state.traffic.size > 2500 || state.lastActive.size > 2500 || state.reqCache.size > 2500 || state.dnsCache.size > DNS_MAX) {
+			const activeUsernames = new Set(state.connections.keys());
+			for (const k of [...state.lastActive.keys()]) {
+				const base = String(k).endsWith("_hb") ? String(k).slice(0, -3) : k;
+				if (!activeUsernames.has(base) && (state.traffic.get(base) || 0) <= 0 && (state.reqCache.get(base) || 0) <= 0) {
+					state.lastActive.delete(k);
+					state.lastActive.delete(base);
+					state.lastWrite.delete(base);
+					state.writeLock.delete(base);
+				}
+			}
+			if (state.dnsCache.size > DNS_MAX) {
+				for (const [key, val] of state.dnsCache.entries()) {
+					if (now > (val && val.expires ? val.expires : 0)) state.dnsCache.delete(key);
+				}
+			}
+		}
+	} catch (e) {}
+}
 let cachedVipCountries = [];
 let lastVipCountriesFetch = 0;
 async function replaceBrokenProxy(username, env, oldProxy) {
@@ -695,6 +723,7 @@ const WorkerApp = {
 				try {
 					ctx.waitUntil(checkAutoResets(env, ctx).catch(() => {}));
 					ctx.waitUntil(checkAutoRotates(env, ctx).catch(() => {}));
+					ctx.waitUntil(periodicStateFlush(env, ctx).catch(() => {}));
 				} catch (e) {}
 			}
 			const url = new URL(request.url);
@@ -2038,13 +2067,14 @@ const DbService = {
 		await schemaPromise;
 		schemaEnsured = true;
 	},
-	async getPanelPassword(db, forceRefresh = true) {
+	async getPanelPassword(db, forceRefresh = false) {
 		try {
+			if (!forceRefresh && cachedPanelPassword != null) return cachedPanelPassword;
 			const row = await db.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
 			cachedPanelPassword = row && row.value ? row.value : null;
 			return cachedPanelPassword;
 		} catch (e) {
-			return null;
+			return cachedPanelPassword != null ? cachedPanelPassword : null;
 		}
 	},
 	async setPanelPassword(db, password) {
@@ -2935,11 +2965,25 @@ function attachRemoteSocket(sock, serverSock, respHeader, addBytes) {
 	}
 	try {
 		if (sock.closed && typeof sock.closed.then === "function") {
-			sock.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+			sock.closed.catch(() => {}).finally(() => {
+				try {
+					closeSocketQuietly(serverSock);
+				} catch (_) {}
+			});
 		}
 	} catch (_) {}
 	try {
-		connectStreams(sock, serverSock, respHeader, null, addBytes);
+		const streamJob = connectStreams(sock, serverSock, respHeader, null, addBytes);
+		if (streamJob && typeof streamJob.then === "function") {
+			streamJob.catch(() => {
+				try {
+					closeSocketQuietly(serverSock);
+				} catch (_) {}
+				try {
+					sock.close();
+				} catch (_) {}
+			});
+		}
 	} catch (_) {
 		try {
 			serverSock.close();
@@ -2955,10 +2999,11 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 	try {
 		let live = 0;
 		for (const n of state.connections.values()) live += n || 0;
-		if (live > 180) {
+		if (live > 100) {
 			return new Response(null, { status: 503, headers: { "Retry-After": "3" } });
 		}
 	} catch (_) {}
+	let uncountedBytes = 0;
 	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
 	let clientIP = rawClientIP;
 	if (rawClientIP !== "unknown") {
@@ -3118,12 +3163,12 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 			try {
 				serverSock.send(new Uint8Array(0));
 				if (!validUUID || !username) {
-					heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
+					heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 8000) + 55000);
 					return;
 				}
 				const nowTime = Date.now();
 				const lastCheck = state.lastActive.get(username + "_hb") || 0;
-				if (nowTime - lastCheck >= 20000) {
+				if (nowTime - lastCheck >= 60000) {
 					state.lastActive.set(username + "_hb", nowTime);
 					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
 					let isExpired = false;
@@ -3182,19 +3227,18 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					}
 				}
 			} catch (e) {}
-			heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
+			heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 8000) + 55000);
 		} else {
 			clearTimeout(heartbeat);
 		}
 	};
-	heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
+	heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 8000) + 55000);
 	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	let reqUUID = null;
 	let isHeaderParsed = false;
 	let isHeaderParsing = false;
 	let isDnsQuery = false;
 	let chunkBuffer = new Uint8Array(0);
-	let uncountedBytes = 0;
 	let wsChain = Promise.resolve();
 	let wsStopped = false,
 		wsFailed = false,
@@ -3287,11 +3331,25 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 						user = await env.DB.prepare("SELECT * FROM users WHERE uuid LIKE ?").bind("%-" + uuidTail).first();
 					}
 					if (!user) {
-						const { results: candidates } = await env.DB.prepare("SELECT * FROM users WHERE is_active = 1").all();
-						for (const cand of candidates || []) {
-							if (sha224Hex(cand.uuid || "") === trojan.hash || sha224Hex(String(cand.uuid || "").replace(/-/g, "")) === trojan.hash) {
-								user = cand;
-								break;
+						try {
+							if (!state.trojanHashCache) state.trojanHashCache = new Map();
+							const cachedName = state.trojanHashCache.get(trojan.hash);
+							if (cachedName) {
+								user = await env.DB.prepare("SELECT * FROM users WHERE username = ? AND is_active = 1").bind(cachedName).first();
+							}
+						} catch (_) {}
+						if (!user) {
+							const { results: candidates } = await env.DB.prepare("SELECT username, uuid FROM users WHERE is_active = 1").all();
+							for (const cand of candidates || []) {
+								if (sha224Hex(cand.uuid || "") === trojan.hash || sha224Hex(String(cand.uuid || "").replace(/-/g, "")) === trojan.hash) {
+									user = await env.DB.prepare("SELECT * FROM users WHERE username = ?").bind(cand.username).first();
+									try {
+										if (!state.trojanHashCache) state.trojanHashCache = new Map();
+										if (state.trojanHashCache.size > 2000) state.trojanHashCache.clear();
+										state.trojanHashCache.set(trojan.hash, cand.username);
+									} catch (_) {}
+									break;
+								}
 							}
 						}
 					}
@@ -4315,14 +4373,32 @@ async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, on
 	if (!hasData && retryFunc) await retryFunc();
 }
 async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
-	const socket = connect({ hostname: address, port: port });
-	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500))]);
-	if (initialData && initialData.byteLength > 0) {
-		const w = socket.writable.getWriter();
-		await w.write(convertToUint8Array(initialData));
-		w.releaseLock();
+	let socket = null;
+	try {
+		socket = connect({ hostname: String(address || ""), port: Number(port) || 0 });
+		if (socket.opened && typeof socket.opened.then === "function") {
+			await Promise.race([
+				socket.opened,
+				new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 4000)),
+			]);
+		}
+		if (initialData && initialData.byteLength > 0) {
+			const w = socket.writable.getWriter();
+			try {
+				await w.write(convertToUint8Array(initialData));
+			} finally {
+				try {
+					w.releaseLock();
+				} catch (_) {}
+			}
+		}
+		return socket;
+	} catch (e) {
+		try {
+			if (socket) socket.close();
+		} catch (_) {}
+		throw e;
 	}
-	return socket;
 }
 async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServer = "8.8.4.4") {
 	const requestData = convertToUint8Array(udpChunk);
@@ -4537,11 +4613,11 @@ async function fetchCfAccountRequestsToday(env) {
 					const q =
 						'query { viewer { accounts(filter: { accountTag: "' +
 						accountId +
-						'" }) { workersInvocationsAdaptive(limit: 10000, filter: { datetime_geq: "' +
+						'" }) { workersInvocationsAdaptive(limit: 100, filter: { datetime_geq: "' +
 						startIso +
 						'", datetime_lt: "' +
 						endIso +
-						'" }) { sum { requests subrequests } dimensions { scriptName } } } } }';
+						'" }) { sum { requests subrequests } } } } }';
 					try {
 						const gRes = await fetch("https://api.cloudflare.com/client/v4/graphql", {
 							method: "POST",
@@ -4562,7 +4638,7 @@ async function fetchCfAccountRequestsToday(env) {
 							const q2 =
 								'query { viewer { accounts(filter: { accountTag: "' +
 								accountId +
-								'" }) { workersInvocationsAdaptive(limit: 10000, filter: { datetime_geq: "' +
+								'" }) { workersInvocationsAdaptive(limit: 100, filter: { datetime_geq: "' +
 								startIso +
 								'", datetime_lt: "' +
 								endIso +
@@ -4605,7 +4681,7 @@ function trackRequest(env, ctx) {
 	state.reqTotal++;
 	state.cfReq.delta = (state.cfReq.delta || 0) + 1;
 	const now = Date.now();
-	if ((now - state.lastReqWrite > 900000 || state.reqTotal > 5000) && state.reqTotal > 0) {
+	if ((now - state.lastReqWrite > 1800000 || state.reqTotal > 20000) && state.reqTotal > 0) {
 		state.lastReqWrite = now;
 		const countToSave = state.reqTotal;
 		state.reqTotal = 0;
@@ -4623,7 +4699,7 @@ function trackRequest(env, ctx) {
 			} catch (e) {}
 		};
 		if (ctx) ctx.waitUntil(task());
-		else task();
+		else task().catch(() => {});
 	}
 }
 async function connectProxy(proxyStr, destAddr, destPort, initialData) {
