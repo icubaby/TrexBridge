@@ -2900,10 +2900,54 @@ async function pickProxiflyProxy(countryCode, maxTest = 2) {
 	return "";
 }
 function resolveUserProxy(user, request) {
-	return getSelectedUserProxy(user && user.user_socks5, request) || "";
+	try {
+		return getSelectedUserProxy(user && user.user_socks5, request) || "";
+	} catch (e) {
+		return "";
+	}
 }
 function userHasExitLock(user) {
-	return !!(user && user.user_socks5 && String(user.user_socks5).trim());
+	try {
+		return !!(user && user.user_socks5 && String(user.user_socks5).trim());
+	} catch (e) {
+		return false;
+	}
+}
+async function connectProxyTimed(proxyStr, destAddr, destPort, initialData, timeoutMs = 8000) {
+	let timer = null;
+	try {
+		return await Promise.race([
+			connectProxy(proxyStr, destAddr, destPort, initialData),
+			new Promise((_, reject) => {
+				timer = setTimeout(() => reject(new Error("proxy_timeout")), timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+function attachRemoteSocket(sock, serverSock, respHeader, addBytes) {
+	if (!sock) {
+		try {
+			serverSock.close();
+		} catch (_) {}
+		return;
+	}
+	try {
+		if (sock.closed && typeof sock.closed.then === "function") {
+			sock.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
+		}
+	} catch (_) {}
+	try {
+		connectStreams(sock, serverSock, respHeader, null, addBytes);
+	} catch (_) {
+		try {
+			serverSock.close();
+		} catch (e2) {}
+		try {
+			sock.close();
+		} catch (e3) {}
+	}
 }
 async function handleVless(env, _unused = null, ctx = null, request = null) {
 	try {
@@ -3412,38 +3456,40 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					}
 					const openRemote = async (payload = null) => {
 						if (remoteConnWrapper.connectingPromise) {
-							await remoteConnWrapper.connectingPromise;
+							try {
+								await remoteConnWrapper.connectingPromise;
+							} catch (_) {}
 							return;
 						}
 						const job = (async () => {
 							let sock = null;
-							const exitProxy = resolveUserProxy(user, request);
-							if (exitProxy) {
-								try {
-									sock = await connectProxy(exitProxy, addr, port, payload);
-								} catch (err) {
-									try { serverSock.close(); } catch (_) {}
-									return;
-								}
-							} else {
-								try {
+							try {
+								const exitProxy = resolveUserProxy(user, request);
+								if (exitProxy) {
+									sock = await connectProxyTimed(exitProxy, addr, port, payload, 8000);
+								} else {
 									sock = await connectDirect(addr, port, payload, targetDoh);
-								} catch (err) {
-									try { serverSock.close(); } catch (_) {}
-									return;
 								}
+							} catch (_) {
+								try {
+									serverSock.close();
+								} catch (e2) {}
+								return;
 							}
 							if (!sock) {
-								try { serverSock.close(); } catch (_) {}
+								try {
+									serverSock.close();
+								} catch (_) {}
 								return;
 							}
 							remoteConnWrapper.socket = sock;
-							sock.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-							connectStreams(sock, serverSock, respHeader, null, addBytes);
+							attachRemoteSocket(sock, serverSock, respHeader, addBytes);
 						})();
 						remoteConnWrapper.connectingPromise = job;
-						try { await job; }
-						finally {
+						try {
+							await job;
+						} catch (_) {
+						} finally {
 							if (remoteConnWrapper.connectingPromise === job) remoteConnWrapper.connectingPromise = null;
 						}
 					};
@@ -3669,38 +3715,39 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 				}
 				const openRemote = async (payload = null) => {
 					if (remoteConnWrapper.connectingPromise) {
-						await remoteConnWrapper.connectingPromise;
+						try {
+							await remoteConnWrapper.connectingPromise;
+						} catch (_) {}
 						return;
 					}
 					const job = (async () => {
 						let sock = null;
-						const exitProxy = resolveUserProxy(user, request);
-						if (exitProxy) {
-							try {
-								sock = await connectProxy(exitProxy, addr, port, payload);
-							} catch (err) {
-								try { serverSock.close(); } catch (_) {}
-								return;
-							}
-						} else {
-							try {
+						try {
+							const exitProxy = resolveUserProxy(user, request);
+							if (exitProxy) {
+								sock = await connectProxyTimed(exitProxy, addr, port, payload, 8000);
+							} else {
 								sock = await connectDirect(addr, port, payload, targetDoh);
-							} catch (err) {
-								try { serverSock.close(); } catch (_) {}
-								return;
 							}
+						} catch (_) {
+							try {
+								serverSock.close();
+							} catch (e2) {}
+							return;
 						}
 						if (!sock) {
-							try { serverSock.close(); } catch (_) {}
+							try {
+								serverSock.close();
+							} catch (_) {}
 							return;
 						}
 						remoteConnWrapper.socket = sock;
-						sock.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-						connectStreams(sock, serverSock, respHeader, null, addBytes);
+						attachRemoteSocket(sock, serverSock, respHeader, addBytes);
 					})();
 					remoteConnWrapper.connectingPromise = job;
 					try {
 						await job;
+					} catch (_) {
 					} finally {
 						if (remoteConnWrapper.connectingPromise === job) {
 							remoteConnWrapper.connectingPromise = null;
