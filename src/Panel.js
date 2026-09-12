@@ -9,6 +9,7 @@ const state = {
   dnsCache: new Map(),
   reqCache: new Map(),
   loginAttempts: new Map(),
+  activeIps: new Map(),
   reqTotal: 0,
   lastReqWrite: 0,
   cfReq: { day: "", base: 0, fetchedAt: 0, delta: 0 },
@@ -1875,10 +1876,11 @@ const Router = {
 							const memGb = memBytes / (1024 * 1024 * 1024);
 							const memReqs = state.reqCache.get(uname) || 0;
 							const connN = state.connections.get(uname) || 0;
+							const memIpN = getLiveIpCount(uname);
 							const ipOnline = getActiveIpCount(user.active_ips);
-							const onlineN = Math.max(ipOnline, connN);
+							const onlineN = Math.max(ipOnline, connN, memIpN);
 							const lastAct = Math.max(Number(user.last_active) || 0, state.lastActive.get(uname) || 0);
-							const isOn = onlineN > 0 || (lastAct && now - lastAct < 60000) ? 1 : 0;
+							const isOn = onlineN > 0 || (lastAct && now - lastAct < 180000) ? 1 : 0;
 							return {
 								...user,
 								used_gb: (parseFloat(user.used_gb) || 0) + memGb,
@@ -2110,12 +2112,20 @@ function getActiveIpCount(activeIpsJson) {
 		let count = 0;
 		for (const [ip, data] of Object.entries(activeIps)) {
 			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-			if (now - lastSeen <= 60000) {
+			if (now - lastSeen <= 180000) {
 				count++;
 			}
 		}
 		return count;
 	} catch (e) {
+		return 0;
+	}
+}
+function getLiveIpCount(username) {
+	try {
+		const mem = state.activeIps.get(username);
+		return mem ? mem.size : 0;
+	} catch (_) {
 		return 0;
 	}
 }
@@ -2312,15 +2322,15 @@ async function flushExpiredTraffic(env) {
 		}
 		if (state.writeLock.get(uname)) continue;
 		const lastActive = state.lastActive.get(uname) || 0;
-		if (activeCount <= 0 || now - lastActive > 20000) {
+		if (activeCount <= 0 || now - lastActive > 60000) {
 			state.writeLock.set(uname, true);
 			state.traffic.set(uname, 0);
 			state.reqCache.set(uname, 0);
 			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
 			try {
-				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, uname).run();
+				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname).run();
 			} catch (e) {
-				console.error(e.message);
+				try { console.error(e && e.message ? e.message : e); } catch (_) {}
 			} finally {
 				state.writeLock.delete(uname);
 				if (activeCount <= 0) {
@@ -3060,8 +3070,8 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 		if (state.writeLock.get(username)) return;
 		let lastDbWrite = state.lastWrite.get(username) || 0;
 		let now = Date.now();
-		let thresholdBytes = 100 * 1024 * 1024;
-		if ((current >= thresholdBytes && now - lastDbWrite > 20000) || (current > 0 && now - lastDbWrite > 120000)) {
+		let thresholdBytes = 500 * 1024 * 1024;
+		if ((current >= thresholdBytes && now - lastDbWrite > 180000) || (current > 0 && now - lastDbWrite > 900000)) {
 			state.writeLock.set(username, true);
 			let toCommit = state.traffic.get(username) || 0;
 			let toCommitReq = state.reqCache.get(username) || 0;
@@ -3075,9 +3085,9 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 			let deltaGb = toCommit / (1024 * 1024 * 1024);
 			let writeTask = async () => {
 				try {
-					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, username).run();
+					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, now, username).run();
 				} catch (e) {
-					console.error(e.message);
+					try { console.error(e && e.message ? e.message : e); } catch (_) {}
 					state.traffic.set(username, (state.traffic.get(username) || 0) + toCommit);
 					state.reqCache.set(username, (state.reqCache.get(username) || 0) + toCommitReq);
 				} finally {
@@ -3085,7 +3095,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 				}
 			};
 			if (ctx) ctx.waitUntil(writeTask());
-			else writeTask();
+			else writeTask().catch(() => {});
 		}
 	}
 	let isOfflineSet = false;
@@ -3095,49 +3105,37 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 		isOfflineSet = true;
 		const uname = username;
 		if (!uname) return;
-		if (clientIP && clientIP !== "unknown" && validUUID) {
-			const removeIpTask = async () => {
-				try {
-					const user = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
-					if (user) {
-						let activeIps = JSON.parse(user.active_ips || "{}");
-						if (activeIps[clientIP]) {
-							if (typeof activeIps[clientIP] === "object") {
-								activeIps[clientIP].count = (activeIps[clientIP].count || 1) - 1;
-								if (activeIps[clientIP].count <= 0) {
-									delete activeIps[clientIP];
-								}
-							} else {
-								delete activeIps[clientIP];
-							}
-							await env.DB.prepare("UPDATE users SET active_ips = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), validUUID).run();
-						}
-					}
-				} catch (e) {
-					console.error(`[setOffline Task] Error: ${e.message}`);
-				}
-			};
-			if (ctx) ctx.waitUntil(removeIpTask());
-			else removeIpTask();
-		}
 		let activeCount = state.connections.get(uname) || 0;
 		if (hasCountedAsActive) {
 			activeCount = Math.max(0, activeCount - 1);
+			try {
+				const userIps = state.activeIps.get(uname);
+				if (userIps && clientIP && clientIP !== "unknown") {
+					const ipConns = userIps.get(clientIP) || 0;
+					if (ipConns <= 1) userIps.delete(clientIP);
+					else userIps.set(clientIP, ipConns - 1);
+					if (userIps.size === 0) state.activeIps.delete(uname);
+				}
+			} catch (_) {}
 		}
 		if (activeCount <= 0) {
 			state.connections.delete(uname);
 			let cachedBytes = state.traffic.get(uname) || 0;
 			let cachedReqs = state.reqCache.get(uname) || 0;
-			if ((cachedBytes > 0 || cachedReqs > 0) && !state.writeLock.get(uname)) {
+			let nowOff = Date.now();
+			let lastWrite = state.lastWrite.get(uname) || 0;
+			let shouldCommit = (cachedBytes >= 20 * 1024 * 1024) || (nowOff - lastWrite > 600000) || (cachedReqs >= 20);
+			if (shouldCommit && (cachedBytes > 0 || cachedReqs > 0) && !state.writeLock.get(uname)) {
 				state.writeLock.set(uname, true);
+				state.lastWrite.set(uname, nowOff);
 				state.traffic.set(uname, (state.traffic.get(uname) || 0) - cachedBytes);
 				state.reqCache.set(uname, (state.reqCache.get(uname) || 0) - cachedReqs);
 				const deltaGb = cachedBytes / (1024 * 1024 * 1024);
 				const writeTask = async () => {
 					try {
-						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, uname).run();
+						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, nowOff, uname).run();
 					} catch (e) {
-						console.error(e.message);
+						try { console.error(e && e.message ? e.message : e); } catch (_) {}
 						state.traffic.set(uname, (state.traffic.get(uname) || 0) + cachedBytes);
 						state.reqCache.set(uname, (state.reqCache.get(uname) || 0) + cachedReqs);
 					} finally {
@@ -3148,7 +3146,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 				if (ctx) {
 					ctx.waitUntil(writeTask());
 				} else {
-					writeTask();
+					writeTask().catch(() => {});
 				}
 			} else {
 				state.lastActive.delete(uname);
@@ -3168,7 +3166,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 				}
 				const nowTime = Date.now();
 				const lastCheck = state.lastActive.get(username + "_hb") || 0;
-				if (nowTime - lastCheck >= 60000) {
+				if (nowTime - lastCheck >= 180000) {
 					state.lastActive.set(username + "_hb", nowTime);
 					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
 					let isExpired = false;
@@ -3177,7 +3175,8 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					if (!user || user.is_active === 0) {
 						isExpired = true;
 					} else {
-						if (user.limit_gb && user.used_gb >= user.limit_gb) isExpired = true;
+						const liveGb = (user.used_gb || 0) + ((state.traffic.get(username) || 0) / (1024 * 1024 * 1024));
+						if (user.limit_gb && liveGb >= user.limit_gb) isExpired = true;
 						if (user.limit_req && user.used_req + (state.reqCache.get(username) || 0) >= user.limit_req) isExpired = true;
 						if (user.expiry_days && user.created_at) {
 							const expiryDate = new Date(new Date(user.created_at).getTime() + user.expiry_days * 86400000);
@@ -3189,24 +3188,33 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 								activeIps = JSON.parse(user.active_ips || "{}");
 							} catch (e) {}
 							let hasChanges = false;
+							let needsTs = false;
 							for (const [ip, data] of Object.entries(activeIps)) {
 								const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-								if (nowTime - lastSeen > 20000) {
+								if (nowTime - lastSeen > 180000 && ip !== clientIP) {
 									delete activeIps[ip];
 									hasChanges = true;
 								}
 							}
 							if (!activeIps[clientIP]) {
-								isIpLimitExpired = true;
+								activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+								hasChanges = true;
 							} else {
-								const sortedIps = Object.keys(activeIps).sort((a, b) => {
-									const tA = typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
-									const tB = typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
-									return tB - tA;
-								});
-								if (user.ip_limit && user.ip_limit > 0 && sortedIps.indexOf(clientIP) >= user.ip_limit) isIpLimitExpired = true;
+								const currentData = activeIps[clientIP];
+								const lastSeen = typeof currentData === "object" ? currentData.timestamp : currentData;
+								if (nowTime - lastSeen > 150000) {
+									if (typeof activeIps[clientIP] === "object") activeIps[clientIP].timestamp = nowTime;
+									else activeIps[clientIP] = { timestamp: nowTime, count: 1 };
+									needsTs = true;
+								}
 							}
-							if (hasChanges || isIpLimitExpired) updatedActiveIps = JSON.stringify(activeIps);
+							const sortedIps = Object.keys(activeIps).sort((a, b) => {
+								const tA = typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
+								const tB = typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
+								return tB - tA;
+							});
+							if (user.ip_limit && user.ip_limit > 0 && sortedIps.indexOf(clientIP) >= user.ip_limit) isIpLimitExpired = true;
+							if (hasChanges || needsTs || isIpLimitExpired) updatedActiveIps = JSON.stringify(activeIps);
 						}
 					}
 					if (isExpired) {
@@ -3221,8 +3229,10 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 						return;
 					}
 					if (updatedActiveIps !== null) {
+						state.lastWrite.set(username, nowTime);
 						await env.DB.prepare("UPDATE users SET last_active = ?, active_ips = ? WHERE username = ?").bind(nowTime, updatedActiveIps, username).run();
-					} else {
+					} else if (nowTime - (state.lastWrite.get(username) || 0) >= 900000) {
+						state.lastWrite.set(username, nowTime);
 						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(nowTime, username).run();
 					}
 				}
@@ -3448,8 +3458,13 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 								activeIps[clientIP] = { timestamp: now, count: 1 };
 							}
 						}
+						try {
+							let memIps = state.activeIps.get(username);
+							if (!memIps) { memIps = new Map(); state.activeIps.set(username, memIps); }
+							memIps.set(clientIP, (memIps.get(clientIP) || 0) + 1);
+						} catch (_) {}
 						const lastWrite = state.lastActive.get(username) || 0;
-						if (isNewIp || now - lastWrite > 30000) {
+						if (isNewIp || now - lastWrite > 120000) {
 							state.lastActive.set(username, now);
 							const updateTask = async () => {
 								try {
@@ -3457,7 +3472,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 								} catch (e) {}
 							};
 							if (ctx) ctx.waitUntil(updateTask());
-							else updateTask();
+							else updateTask().catch(() => {});
 						}
 					}
 					isHeaderParsed = true;
@@ -3465,15 +3480,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					state.connections.set(username, activeCount + 1);
 					hasCountedAsActive = true;
 					if (activeCount === 0) {
-						const setOnlineTask = async () => {
-							try {
-								const now = Date.now();
-								state.lastActive.set(username, now);
-								await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
-							} catch (e) {}
-						};
-						if (ctx) ctx.waitUntil(setOnlineTask());
-						else setOnlineTask();
+						state.lastActive.set(username, Date.now());
 					}
 					let addr = trojan.addr;
 					const port = trojan.port;
@@ -3684,8 +3691,13 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 						activeIps[clientIP] = { timestamp: now, count: 1 };
 					}
 				}
+				try {
+					let memIps = state.activeIps.get(username);
+					if (!memIps) { memIps = new Map(); state.activeIps.set(username, memIps); }
+					memIps.set(clientIP, (memIps.get(clientIP) || 0) + 1);
+				} catch (_) {}
 				const lastWrite = state.lastActive.get(username) || 0;
-				if (isNewIp || now - lastWrite > 30000) {
+				if (isNewIp || now - lastWrite > 120000) {
 					state.lastActive.set(username, now);
 					const updateTask = async () => {
 						try {
@@ -3693,7 +3705,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 						} catch (e) {}
 					};
 					if (ctx) ctx.waitUntil(updateTask());
-					else updateTask();
+					else updateTask().catch(() => {});
 				}
 			}
 			isHeaderParsed = true;
@@ -3701,15 +3713,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 			state.connections.set(username, activeCount + 1);
 			hasCountedAsActive = true;
 			if (activeCount === 0) {
-				const setOnlineTask = async () => {
-					try {
-						const now = Date.now();
-						state.lastActive.set(username, now);
-						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
-					} catch (e) {}
-				};
-				if (ctx) ctx.waitUntil(setOnlineTask());
-				else setOnlineTask();
+				state.lastActive.set(username, Date.now());
 			}
 			try {
 				let offset = 17;
