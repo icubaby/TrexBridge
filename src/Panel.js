@@ -1,4 +1,4 @@
-import { connect } from "cloudflare:sockets";
+  import { connect } from "cloudflare:sockets";
 
 const state = {
   traffic: new Map(),
@@ -10,11 +10,30 @@ const state = {
   reqCache: new Map(),
   loginAttempts: new Map(),
   activeIps: new Map(),
+  blockedUsers: new Map(),
   reqTotal: 0,
   lastReqWrite: 0,
   cfReq: { day: "", base: 0, fetchedAt: 0, delta: 0 },
   proxyCursor: { list: [], at: 0, fetchedAt: 0 },
 };
+
+
+function isUserBlocked(username) {
+  if (!username) return false;
+  const t = state.blockedUsers.get(username);
+  if (!t) return false;
+  if (Date.now() - t > 86400000) {
+    state.blockedUsers.delete(username);
+    return false;
+  }
+  return true;
+}
+function markUserBlocked(username) {
+  if (username) state.blockedUsers.set(username, Date.now());
+}
+function clearUserBlocked(username) {
+  if (username) state.blockedUsers.delete(username);
+}
 
 const DNS_TTL_MS = 5 * 60 * 1000;
 const DNS_MAX = 2048;
@@ -32,20 +51,6 @@ const FLUX_QUERY =
   "&fragment2=" + encodeURIComponent("1-1,109,1,1,355");
 const FLUX_QUERY_SAFE =
   "&fragment=" + encodeURIComponent("tlshello,5,94,1,0");
-const DEFAULT_FRAG_QUERY = "";
-const FLUX_JSON = JSON.stringify({
-  mode: "flux",
-  packets: "tlshello",
-  length: "5,94,1",
-  interval: "0",
-  maxSplit: "0",
-  dual: true,
-  packets2: "1-1",
-  length2: "109,1",
-  interval2: "1",
-  maxSplit2: "355",
-  protocols: "vless",
-});
 const DEFAULT_FRAG_JSON = JSON.stringify({
   mode: "default",
   packets: "",
@@ -60,8 +65,6 @@ const CLEAN_IP_URL =
   "https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main/data/CleanIP.json";
 const REPO_BASE =
   "https://raw.githubusercontent.com/icubaby/TrexBridge/refs/heads/main";
-const PROXY_LIST_URL =
-  "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=json";
 
 function isFluxFrag(userOrFrag) {
   try {
@@ -207,7 +210,7 @@ function configLinks(user, host) {
   const fp = (user && user.fingerprint) || "chrome";
   const path = encodeURIComponent("/api/ws");
   const frag = fragOptions(user);
-  const userFrag = frag && frag.flux === false ? "" : FLUX_QUERY;
+  const userFrag = frag && frag.flux ? FLUX_QUERY : "";
   const protos = frag.protos && frag.protos.length ? frag.protos : ["vless"];
   const uuid = (user && user.uuid) || "";
   const links = [];
@@ -297,14 +300,23 @@ async function fetchRepo(path, options = {}) {
 	return await fetch(REPO_BASE + "/" + p, options);
 }
 
+let _cleanIpCache = { data: null, at: 0 };
 async function loadCleanIps() {
+	const now = Date.now();
+	if (_cleanIpCache.data && now - _cleanIpCache.at < 3600000) {
+		return _cleanIpCache.data;
+	}
 	try {
 		const res = await fetchRepo("data/CleanIP.json", { cache: "no-store" });
-		if (!res || !res.ok) return {};
+		if (!res || !res.ok) return _cleanIpCache.data || {};
 		const data = await res.json();
-		return data && typeof data === "object" ? data : {};
+		if (data && typeof data === "object") {
+			_cleanIpCache = { data, at: now };
+			return data;
+		}
+		return _cleanIpCache.data || {};
 	} catch (e) {
-		return {};
+		return _cleanIpCache.data || {};
 	}
 }
 
@@ -374,30 +386,30 @@ async function checkAutoResets(env, ctx) {
 		localLastAutoResetCheck = now;
 		if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=3600" } })));
 		const todayUtc = Math.floor(now / 86400000) * 86400000;
-		await env.DB.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
-		await env.DB.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
+		await env.DB.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (COALESCE(last_reset_vol_time, 0) + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
+		await env.DB.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (COALESCE(last_reset_req_time, 0) + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
 	} catch (e) {}
 }
 let localLastIpRotateCheck = 0;
 async function checkAutoRotates(env, ctx) {
 	const now = Date.now();
-	if (now - localLastIpRotateCheck < 60000) return;
+	if (now - localLastIpRotateCheck < 120000) return;
 	try {
 		const cache = caches.default;
 		const cacheReq = new Request("https://internal.app/cache/rotate");
 		if (await cache.match(cacheReq)) return;
 		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_ip_rotate_check'").first();
 		const dbLastCheck = row ? parseInt(row.value) || 0 : 0;
-		if (now - dbLastCheck < 60000) {
+		if (now - dbLastCheck < 120000) {
 			localLastIpRotateCheck = dbLastCheck;
-			const ttl = Math.floor((60000 - (now - dbLastCheck)) / 1000);
+			const ttl = Math.floor((120000 - (now - dbLastCheck)) / 1000);
 			if (ttl > 0 && ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": `max-age=${ttl}` } })));
 			return;
 		}
 		await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_ip_rotate_check', ?)").bind(String(now)).run();
 		localLastIpRotateCheck = now;
-		if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=60" } })));
-		const { results: usersToRotate } = await env.DB.prepare("SELECT * FROM users WHERE auto_rotate_ip = 1 AND ? >= (last_rotate_time + (rotate_time * 60000))").bind(now).all();
+		if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=120" } })));
+		const { results: usersToRotate } = await env.DB.prepare("SELECT * FROM users WHERE auto_rotate_ip = 1 AND COALESCE(rotate_time, 0) > 0 AND ? >= (COALESCE(last_rotate_time, 0) + (COALESCE(rotate_time, 0) * 60000))").bind(now).all();
 		if (!usersToRotate || usersToRotate.length === 0) return;
 				const res = await fetchRepo("data/CleanIP.json");
 		if (!res.ok) return;
@@ -458,11 +470,10 @@ async function periodicStateFlush(env, ctx) {
 			const activeUsernames = new Set(state.connections.keys());
 			for (const k of [...state.lastActive.keys()]) {
 				const base = String(k).endsWith("_hb") ? String(k).slice(0, -3) : k;
-				if (!activeUsernames.has(base) && (state.traffic.get(base) || 0) <= 0 && (state.reqCache.get(base) || 0) <= 0) {
+				if (!activeUsernames.has(base) && (state.traffic.get(base) || 0) <= 0 && (state.reqCache.get(base) || 0) <= 0 && !state.writeLock.get(base)) {
 					state.lastActive.delete(k);
 					state.lastActive.delete(base);
 					state.lastWrite.delete(base);
-					state.writeLock.delete(base);
 				}
 			}
 			if (state.dnsCache.size > DNS_MAX) {
@@ -472,219 +483,6 @@ async function periodicStateFlush(env, ctx) {
 			}
 		}
 	} catch (e) {}
-}
-let cachedVipCountries = [];
-let lastVipCountriesFetch = 0;
-async function replaceBrokenProxy(username, env, oldProxy) {
-	return;
-	try {
-		if (state.writeLock.get(username + "_proxy_rotate")) return;
-		state.writeLock.set(username + "_proxy_rotate", true);
-		const user = await env.DB.prepare("SELECT id, user_socks5, auto_rotate_user_proxy FROM users WHERE username = ?").bind(username).first();
-		if (!user || user.auto_rotate_user_proxy !== 1 || !user.user_socks5) {
-			state.writeLock.delete(username + "_proxy_rotate");
-			return;
-		}
-		let proxyList = [];
-		let isArrayMode = false;
-		try {
-			if (user.user_socks5.trim().startsWith("[")) {
-				proxyList = JSON.parse(user.user_socks5);
-				isArrayMode = true;
-			} else {
-				proxyList = [user.user_socks5];
-			}
-		} catch (e) {
-			proxyList = [user.user_socks5];
-		}
-		let matchIndex = -1;
-		for (let i = 0; i < proxyList.length; i++) {
-			let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
-			if (itemStr === oldProxy) {
-				matchIndex = i;
-				break;
-			}
-		}
-		if (matchIndex === -1) {
-			state.writeLock.delete(username + "_proxy_rotate");
-			return;
-		}
-		let countryCode = typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null && proxyList[matchIndex].country ? proxyList[matchIndex].country : "all";
-		try {
-			const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-			const s = await connectProxy(oldProxy, "ip-api.com", 80, payload);
-			const reader = s.readable.getReader();
-			let resStr = "";
-			const dec = new TextDecoder();
-			const timeoutId = setTimeout(() => {
-				try {
-					s.close();
-				} catch (e) {}
-			}, 2000);
-			try {
-				while (true) {
-					const res = await reader.read();
-					if (res.done || !res.value) break;
-					resStr += dec.decode(res.value, { stream: true });
-					if (resStr.includes("countryCode")) break;
-				}
-			} finally {
-				clearTimeout(timeoutId);
-				try {
-					s.close();
-				} catch (e) {}
-			}
-			const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-			if (jsonMatch && jsonMatch[1]) countryCode = jsonMatch[1];
-		} catch (e) {}
-		if (countryCode === "all") {
-			try {
-				let remain = oldProxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-				if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-				if (remain.startsWith("[")) remain = remain.substring(1, remain.indexOf("]"));
-				else if (remain.includes(":")) remain = remain.substring(0, remain.lastIndexOf(":"));
-				const geoRes = await fetch(`http://ip-api.com/json/${remain}?fields=countryCode`);
-				const geoData = await geoRes.json();
-				if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
-			} catch (e) {}
-		}
-		let newProxy = null;
-		const upperCountry = countryCode.toUpperCase();
-		const sources = [];
-		const isOldProxyVIP = oldProxy.includes("@");
-		if (cachedVipCountries.length === 0 || Date.now() - lastVipCountriesFetch > 3600000) {
-			try {
-				const ghRes = await fetchRepo("vip-list", {
-					headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
-				});
-				if (ghRes.ok) {
-					const files = await ghRes.json();
-					cachedVipCountries = files.filter((f) => f.name.endsWith(".txt")).map((f) => f.name.replace(".txt", "").toUpperCase());
-					lastVipCountriesFetch = Date.now();
-				}
-			} catch (e) {}
-		}
-		let fallbackVIPs = cachedVipCountries.length > 0 ? [...cachedVipCountries] : ["DE", "US", "GB", "NL", "FR", "TR"];
-		for (let i = fallbackVIPs.length - 1; i > 0; i--) {
-			const j = Math.floor(Math.random() * (i + 1));
-			[fallbackVIPs[i], fallbackVIPs[j]] = [fallbackVIPs[j], fallbackVIPs[i]];
-		}
-		if (upperCountry !== "ALL" && upperCountry !== "UN") {
-			sources.push({ url: `proxy_vip/${upperCountry}.txt`, type: "repo" });
-		}
-		for (const fc of fallbackVIPs) {
-			if (fc !== upperCountry) {
-				sources.push({ url: `proxy_vip/${fc}.txt`, type: "repo" });
-			}
-		}
-		if (!isOldProxyVIP) {
-			if (upperCountry !== "ALL" && upperCountry !== "UN") {
-				sources.push({ url: `proxy/${upperCountry}.txt`, type: "repo" });
-			}
-			sources.push({ url: `proxy/ALL.txt`, type: "repo" });
-		}
-		for (const src of sources) {
-			try {
-				const res = await fetchRepo(src.url);
-				if (!res.ok) continue;
-				const text = await res.text();
-				const lines = text
-					.split("\n")
-					.map((l) => l.trim())
-					.filter((l) => l.length > 5);
-				if (lines.length > 0) {
-					for (let i = lines.length - 1; i > 0; i--) {
-						const j = Math.floor(Math.random() * (i + 1));
-						[lines[i], lines[j]] = [lines[j], lines[i]];
-					}
-					const testBatch = lines.slice(0, 3).flatMap((line) => {
-						if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) {
-							return [line];
-						}
-						if (src.type === "socks5") return [`socks5://${line}`];
-						if (src.type === "http") return [`http://${line}`];
-						return [`socks5://${line}`, `http://${line}`];
-					});
-					try {
-						newProxy = await Promise.any(
-							testBatch.map((p) => {
-								return new Promise(async (resolve, reject) => {
-									let sock = null;
-									const timeoutId = setTimeout(() => {
-										try {
-											sock && sock.close();
-										} catch (e) {}
-										reject(new Error("timeout"));
-									}, 3000);
-									try {
-										const payload = UTF8.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-										sock = await connectProxy(p, "1.1.1.1", 80, payload);
-										const reader = sock.readable.getReader();
-										const res = await reader.read();
-										clearTimeout(timeoutId);
-										try {
-											sock.close();
-										} catch (e) {}
-										if (res.done || !res.value) reject(new Error("empty"));
-										else resolve(p);
-									} catch (e) {
-										clearTimeout(timeoutId);
-										try {
-											sock && sock.close();
-										} catch (err) {}
-										reject(e);
-									}
-								});
-							}),
-						);
-					} catch (e) {
-						continue;
-					}
-					if (newProxy) {
-						break;
-					}
-				}
-			} catch (e) {}
-		}
-		if (newProxy) {
-			let finalProxyVal = newProxy;
-			if (isArrayMode) {
-				if (typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null) {
-					proxyList[matchIndex].proxy = newProxy;
-				} else {
-					proxyList[matchIndex] = newProxy;
-				}
-				finalProxyVal = JSON.stringify(proxyList);
-			}
-			await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(finalProxyVal, user.id).run();
-		}
-	} catch (e) {
-	} finally {
-		state.writeLock.delete(username + "_proxy_rotate");
-	}
-}
-
-const SOURCE_XOR_KEY = new Uint8Array([47, 145, 74, 211, 8, 126, 197, 22]);
-function utf8Bytes(str) {
-	return new TextEncoder().encode(str);
-}
-function panelBytesToBase64(bytes) {
-	let binary = "";
-	const chunk = 0x8000;
-	for (let i = 0; i < bytes.length; i += chunk) {
-		binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-	}
-	return btoa(binary);
-}
-function xorPayload(bytes, k) {
-	const out = new Uint8Array(bytes.length);
-	for (let i = 0; i < bytes.length; i++) {
-		let x = bytes[i] ^ k[i % k.length];
-		x = ((x << 4) | (x >> 4)) & 255;
-		x = (x + i * 3 + k[(i + 3) % k.length]) & 255;
-		out[i] = x;
-	}
-	return panelBytesToBase64(out);
 }
 function stripSourceImports(raw) {
 	let s = String(raw || "").replace(/^\uFEFF/, "").replace(/\r\n/g, "\n");
@@ -1794,16 +1592,23 @@ const Router = {
 		if (url.pathname.startsWith("/api/users")) {
 			const pathParts = url.pathname.split("/").filter(Boolean);
 			if (pathParts.length >= 4 && pathParts[pathParts.length - 1] === "configs" && request.method === "GET") {
-				const username = decodeSafe(pathParts[pathParts.length - 2] || "");
-				const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE").bind(username).first();
-				if (!user) {
-					return new Response(JSON.stringify({ error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+				try {
+					const username = decodeSafe(pathParts[pathParts.length - 2] || "");
+					const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE").bind(username).first();
+					if (!user) {
+						return new Response(JSON.stringify({ error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+					}
+					const host = url.hostname;
+					const links = configLinks(user, host) || [];
+					return new Response(JSON.stringify({ links, count: links.length, trex: isFluxFrag(user), frag_len: user.frag_len || "" }), {
+						headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+					});
+				} catch (eCfg) {
+					return new Response(JSON.stringify({ error: "Failed to build configs", links: [], count: 0 }), {
+						status: 500,
+						headers: { "Content-Type": "application/json" },
+					});
 				}
-				const host = url.hostname;
-				const links = configLinks(user, host);
-				return new Response(JSON.stringify({ links, count: links.length, trex: isFluxFrag(user), frag_len: user.frag_len || "" }), {
-					headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
-				});
 			}
 			const isUserAction = pathParts.length > 2;
 			if (isUserAction) {
@@ -1815,16 +1620,24 @@ const Router = {
 					}
 					if (body.toggle_only !== undefined) {
 						await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
+						try {
+							const row = await env.DB.prepare("SELECT is_active FROM users WHERE username = ?").bind(username).first();
+							if (row && row.is_active === 1) clearUserBlocked(username);
+							else markUserBlocked(username);
+						} catch (_) {}
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else if (body.reset_action !== undefined) {
 						if (body.reset_action === "volume") {
 							await env.DB.prepare("UPDATE users SET used_gb = 0, is_active = 1 WHERE username = ?").bind(username).run();
 							state.traffic.set(username, 0);
+							clearUserBlocked(username);
 						} else if (body.reset_action === "req") {
 							await env.DB.prepare("UPDATE users SET used_req = 0, is_active = 1 WHERE username = ?").bind(username).run();
 							state.reqCache.set(username, 0);
+							clearUserBlocked(username);
 						} else if (body.reset_action === "time") {
 							await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP, is_active = 1 WHERE username = ?").bind(username).run();
+							clearUserBlocked(username);
 						}
 						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
 					} else {
@@ -1880,16 +1693,17 @@ const Router = {
 							const connN = state.connections.get(uname) || 0;
 							const memIpN = getLiveIpCount(uname);
 							const ipOnline = getActiveIpCount(user.active_ips);
-							const onlineN = Math.max(ipOnline, connN, memIpN);
+							// Live sockets first; fall back to recent IP map (45s). Never invent a fake "1".
+							const onlineN = Math.max(connN, memIpN, ipOnline);
 							const lastAct = Math.max(Number(user.last_active) || 0, state.lastActive.get(uname) || 0);
-							const isOn = onlineN > 0 || (lastAct && now - lastAct < 180000) ? 1 : 0;
+							const isOn = onlineN > 0 ? 1 : 0;
 							return {
 								...user,
 								used_gb: (parseFloat(user.used_gb) || 0) + memGb,
 								used_req: (parseInt(user.used_req, 10) || 0) + memReqs,
 								last_active: lastAct || user.last_active,
 								is_online: isOn,
-								online_count: onlineN || (isOn ? 1 : 0),
+								online_count: onlineN,
 							};
 						});
 						let cfReqs = { today: 0, total: 0, limit: 100000 };
@@ -2114,7 +1928,7 @@ function getActiveIpCount(activeIpsJson) {
 		let count = 0;
 		for (const [ip, data] of Object.entries(activeIps)) {
 			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-			if (now - lastSeen <= 180000) {
+			if (now - (Number(lastSeen) || 0) <= 45000) {
 				count++;
 			}
 		}
@@ -2180,7 +1994,7 @@ const SubscriptionService = {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
-<title>TrexBridge · subscription · v3</title>
+<title>TrexBridge · subscription · v4</title>
 <style>
 :root{--bg:#f5f0e8;--card:#fffdf5;--ink:#0a0a0a;--muted:#71717a;--green:#22c55e;--lime:#bef264;--yellow:#facc15;--sky:#7dd3fc;--red:#ef4444}
 *{box-sizing:border-box;margin:0;padding:0;border-radius:0!important}
@@ -2257,7 +2071,7 @@ body{font-family:system-ui,sans-serif;font-weight:700;background:var(--bg);color
   </div>
   <div class="links-header"><span class="links-title">Configs</span></div>
   <div class="links-list" id="list"></div>
-  <div class="footer">TrexBridge · subscription · v3</div>
+  <div class="footer">TrexBridge · subscription · v4</div>
 </div>
 <div id="toast"></div>
 <script>
@@ -2324,18 +2138,20 @@ async function flushExpiredTraffic(env) {
 		}
 		if (state.writeLock.get(uname)) continue;
 		const lastActive = state.lastActive.get(uname) || 0;
-		if (activeCount <= 0 || now - lastActive > 60000) {
+		if (activeCount <= 0 || now - lastActive > 90000) {
 			state.writeLock.set(uname, true);
-			state.traffic.set(uname, 0);
-			state.reqCache.set(uname, 0);
 			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
+			state.traffic.set(uname, (state.traffic.get(uname) || 0) - cachedBytes);
+			state.reqCache.set(uname, (state.reqCache.get(uname) || 0) - cachedReqs);
 			try {
 				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ?, last_active = ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, now, uname).run();
 			} catch (e) {
 				try { console.error(e && e.message ? e.message : e); } catch (_) {}
+				state.traffic.set(uname, (state.traffic.get(uname) || 0) + cachedBytes);
+				state.reqCache.set(uname, (state.reqCache.get(uname) || 0) + cachedReqs);
 			} finally {
 				state.writeLock.delete(uname);
-				if (activeCount <= 0) {
+				if (activeCount <= 0 && (state.traffic.get(uname) || 0) <= 0 && (state.reqCache.get(uname) || 0) <= 0) {
 					state.lastActive.delete(uname);
 					state.lastActive.delete(uname + "_hb");
 				}
@@ -3044,20 +2860,18 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 			uncountedBytes = 0;
 		}
 		let current = state.traffic.get(username) || 0;
-		state.traffic.set(username, current + bytes);
+		const total = current + bytes;
+		state.traffic.set(username, total);
 		state.lastActive.set(username, Date.now());
-		// prevent unbounded Map growth under high churn
 		if (state.traffic.size > 4000) {
 			try {
 				const nowP = Date.now();
 				for (const [k, ts] of state.lastActive) {
-					if (nowP - (ts || 0) > 120000) {
+					if (nowP - (ts || 0) > 120000 && !state.writeLock.get(k) && !state.connections.get(k)) {
 						state.traffic.delete(k);
 						state.lastActive.delete(k);
 						state.reqCache.delete(k);
-						state.writeLock.delete(k);
 						state.lastWrite.delete(k);
-						state.connections.delete(k);
 					}
 				}
 			} catch (_) {}
@@ -3065,8 +2879,8 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 		if (state.writeLock.get(username)) return;
 		let lastDbWrite = state.lastWrite.get(username) || 0;
 		let now = Date.now();
-		let thresholdBytes = 100 * 1024 * 1024;
-		if ((current >= thresholdBytes && now - lastDbWrite > 20000) || (current > 0 && now - lastDbWrite > 120000)) {
+		let thresholdBytes = 15 * 1024 * 1024;
+		if ((total >= thresholdBytes && now - lastDbWrite > 20000) || (total > 0 && now - lastDbWrite > 90000)) {
 			state.writeLock.set(username, true);
 			let toCommit = state.traffic.get(username) || 0;
 			let toCommitReq = state.reqCache.get(username) || 0;
@@ -3110,6 +2924,17 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					if (ipConns <= 1) userIps.delete(clientIP);
 					else userIps.set(clientIP, ipConns - 1);
 					if (userIps.size === 0) state.activeIps.delete(uname);
+					// Only persist when this was the last live socket for the user (fewer D1 writes)
+					if (validUUID && activeCount <= 0) {
+						const persist = async () => {
+							try {
+								const nowDrop = Date.now();
+								await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind("{}", nowDrop, validUUID).run();
+							} catch (_) {}
+						};
+						if (ctx) ctx.waitUntil(persist());
+						else persist().catch(() => {});
+					}
 				}
 			} catch (_) {}
 		}
@@ -3155,7 +2980,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 			try {
 				serverSock.send(new Uint8Array(0));
 				if (!validUUID || !username) {
-					heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 8000) + 55000);
+					heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 10000) + 90000);
 					return;
 				}
 				const nowTime = Date.now();
@@ -3166,7 +2991,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					let isExpired = false;
 					let isIpLimitExpired = false;
 					let updatedActiveIps = null;
-					if (!user || user.is_active === 0) {
+					if (!user || user.is_active === 0 || isUserBlocked(username)) {
 						isExpired = true;
 					} else {
 						const liveGb = (user.used_gb || 0) + ((state.traffic.get(username) || 0) / (1024 * 1024 * 1024));
@@ -3212,6 +3037,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 						}
 					}
 					if (isExpired) {
+						markUserBlocked(username);
 						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
 						clearTimeout(heartbeat);
 						closeSocketQuietly(serverSock);
@@ -3231,12 +3057,12 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					}
 				}
 			} catch (e) {}
-			heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 8000) + 55000);
+			heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 10000) + 90000);
 		} else {
 			clearTimeout(heartbeat);
 		}
 	};
-	heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 8000) + 55000);
+	heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 10000) + 90000);
 	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
 	let reqUUID = null;
 	let isHeaderParsed = false;
@@ -3385,21 +3211,37 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					username = user.username;
 					validUUID = user.uuid;
 					reqUUID = user.uuid;
-					let currentReqs = state.reqCache.get(username) || 0;
-					state.reqCache.set(username, currentReqs + 1);
 					if (!state.traffic.has(username)) state.traffic.set(username, 0);
 					if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) return;
-					if (user.is_active === 0) { serverSock.close(); return; }
-					if (user.limit_gb && user.used_gb >= user.limit_gb) { serverSock.close(); return; }
-					if (user.limit_req && user.used_req + (state.reqCache.get(username) || 0) > user.limit_req) { serverSock.close(); return; }
+					if (user.is_active === 0 || isUserBlocked(username)) {
+						markUserBlocked(username);
+						serverSock.close();
+						return;
+					}
+					{
+						const liveGb = (parseFloat(user.used_gb) || 0) + ((state.traffic.get(username) || 0) / (1024 * 1024 * 1024));
+						const liveReq = (parseInt(user.used_req, 10) || 0) + (state.reqCache.get(username) || 0);
+						if ((user.limit_gb && liveGb >= user.limit_gb) || (user.limit_req && liveReq > user.limit_req)) {
+							markUserBlocked(username);
+							try { await env.DB.prepare("UPDATE users SET is_active = 0 WHERE uuid = ?").bind(user.uuid).run(); } catch (e) {}
+							serverSock.close();
+							return;
+						}
+					}
 					if (user.expiry_days && user.created_at) {
 						const created = new Date(user.created_at);
 						const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
 						if (new Date() > expiryDate) {
+							markUserBlocked(username);
 							try { await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(user.uuid).run(); } catch (e) {}
 							serverSock.close();
 							return;
 						}
+					}
+					clearUserBlocked(username);
+					{
+						let currentReqs = state.reqCache.get(username) || 0;
+						state.reqCache.set(username, currentReqs + 1);
 					}
 
 					try {
@@ -3458,7 +3300,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 							memIps.set(clientIP, (memIps.get(clientIP) || 0) + 1);
 						} catch (_) {}
 						const lastWrite = state.lastActive.get(username) || 0;
-						if (isNewIp || now - lastWrite > 120000) {
+						if (isNewIp || now - lastWrite > 180000) {
 							state.lastActive.set(username, now);
 							const updateTask = async () => {
 								try {
@@ -3609,30 +3451,32 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 			}
 			username = user.username;
 			validUUID = reqUUID;
-			let currentReqs = state.reqCache.get(username) || 0;
-			state.reqCache.set(username, currentReqs + 1);
 			if (!state.traffic.has(username)) {
 				state.traffic.set(username, 0);
 			}
 			if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
 				return;
 			}
-			if (user.is_active === 0) {
+			if (user.is_active === 0 || isUserBlocked(username)) {
+				markUserBlocked(username);
 				serverSock.close();
 				return;
 			}
-			if (user.limit_gb && user.used_gb >= user.limit_gb) {
-				serverSock.close();
-				return;
-			}
-			if (user.limit_req && user.used_req + (state.reqCache.get(username) || 0) > user.limit_req) {
-				serverSock.close();
-				return;
+			{
+				const liveGb = (parseFloat(user.used_gb) || 0) + ((state.traffic.get(username) || 0) / (1024 * 1024 * 1024));
+				const liveReq = (parseInt(user.used_req, 10) || 0) + (state.reqCache.get(username) || 0);
+				if ((user.limit_gb && liveGb >= user.limit_gb) || (user.limit_req && liveReq > user.limit_req)) {
+					markUserBlocked(username);
+					try { await env.DB.prepare("UPDATE users SET is_active = 0 WHERE uuid = ?").bind(reqUUID).run(); } catch (e) {}
+					serverSock.close();
+					return;
+				}
 			}
 			if (user.expiry_days && user.created_at) {
 				const created = new Date(user.created_at);
 				const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
 				if (new Date() > expiryDate) {
+					markUserBlocked(username);
 					try {
 						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(reqUUID).run();
 					} catch (e) {}
@@ -3640,6 +3484,12 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					return;
 				}
 			}
+			clearUserBlocked(username);
+			{
+				let currentReqs = state.reqCache.get(username) || 0;
+				state.reqCache.set(username, currentReqs + 1);
+			}
+
 			try {
 				let _fx2 = null;
 				try { if (user.frag_len && String(user.frag_len).trim().charAt(0) === "{") _fx2 = JSON.parse(String(user.frag_len)); } catch (e0) {}
@@ -3696,7 +3546,7 @@ async function handleVless(env, _unused = null, ctx = null, request = null) {
 					memIps.set(clientIP, (memIps.get(clientIP) || 0) + 1);
 				} catch (_) {}
 				const lastWrite = state.lastActive.get(username) || 0;
-				if (isNewIp || now - lastWrite > 120000) {
+				if (isNewIp || now - lastWrite > 180000) {
 					state.lastActive.set(username, now);
 					const updateTask = async () => {
 						try {
@@ -4658,7 +4508,7 @@ function trackRequest(env, ctx) {
 	state.reqTotal++;
 	state.cfReq.delta = (state.cfReq.delta || 0) + 1;
 	const now = Date.now();
-	if ((now - state.lastReqWrite > 1800000 || state.reqTotal > 20000) && state.reqTotal > 0) {
+	if ((now - state.lastReqWrite > 3600000 || state.reqTotal > 40000) && state.reqTotal > 0) {
 		state.lastReqWrite = now;
 		const countToSave = state.reqTotal;
 		state.reqTotal = 0;
@@ -7308,7 +7158,7 @@ function TrexBridgePanel() {
     loadUsers(false);
     timer.current = setInterval(() => {
       if (!document.hidden) loadUsers(true);
-    }, 12000);
+    }, 45000);
     return () => clearInterval(timer.current);
   }, [loadUsers]);
   const reqPct = Math.min(100, stats.requestsLimit > 0 ? stats.requestsToday / stats.requestsLimit * 100 : 0);
@@ -9562,7 +9412,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.c
       GitHub
     </a>
   </div>
-  <div class="footer">TrexBridge · subscription · v3</div>
+  <div class="footer">TrexBridge · subscription · v4</div>
 </div>
 <div id="toast-wrap"></div>
 <script>
