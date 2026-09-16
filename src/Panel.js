@@ -841,7 +841,7 @@ const Router = {
 					const t0 = Date.now();
 					let live = false;
 					try {
-						live = await isProxyLive(proxyUrl, 1400);
+						live = await isProxyLive(proxyUrl, 2800);
 					} catch (_) {
 						live = false;
 					}
@@ -1007,7 +1007,7 @@ const Router = {
 							{ status: 502, headers: { "Content-Type": "application/json; charset=utf-8" } },
 						);
 					}
-					const maxTry = Math.min(3, pool.length);
+					const maxTry = Math.min(12, pool.length);
 					let tried = 0;
 					for (let ti = 0; ti < maxTry; ti++) {
 						tried++;
@@ -1058,7 +1058,7 @@ const Router = {
 						headers: { "Content-Type": "application/json; charset=utf-8" },
 					});
 				}
-				const maxTry = findLive ? Math.min(3, n) : 1;
+				const maxTry = Math.min(findLive ? 12 : 8, n);
 				let tried = 0;
 				const startIdx = ((state.proxyCursor.at % n) + n) % n;
 				for (let k = 0; k < maxTry; k++) {
@@ -1570,7 +1570,7 @@ const Router = {
 				const cc = (url.searchParams.get("cc") || "").trim().toUpperCase();
 				if (!cc) return new Response(JSON.stringify({ ok: false, error: "cc required" }), { status: 400, headers: { "Content-Type": "application/json" } });
 				const force = url.searchParams.get("force") === "1";
-				const proxies = await buildExitProxiesForCountry(cc, 6, 2, force);
+				const proxies = await buildExitProxiesForCountry(cc, 8, 3, force);
 				const cached = _exitPingCache[cc];
 				const cachedAge = cached ? Date.now() - cached.at : null;
 				return new Response(JSON.stringify({
@@ -2554,7 +2554,7 @@ async function buildExitProxiesForCountry(cc, maxTest = 6, topN = 2, force = fal
 		const t0 = Date.now();
 		let ok = false;
 		try {
-			ok = await isProxyLive(proxy, 900);
+			ok = await isProxyLive(proxy, 2800);
 		} catch (e) {
 			ok = false;
 		}
@@ -2594,7 +2594,7 @@ async function testProxyTcpOpen(host, port, timeoutMs = 2000) {
 		return false;
 	}
 }
-async function pickRandomExitProxy(maxTry = 2) {
+async function pickRandomExitProxy(maxTry = 10) {
 	const list = await fetchExitProxyUniverse(25);
 	if (!list.length) return null;
 	const socks5 = list.filter((p) => String(p.protocol || "").toLowerCase().includes("socks5"));
@@ -2611,30 +2611,19 @@ async function pickRandomExitProxy(maxTry = 2) {
 		ordered[j] = tmp;
 	}
 	ordered.sort((a, b) => exitProtoRank(a.protocol) - exitProtoRank(b.protocol));
-	const tryN = Math.min(maxTry, ordered.length);
-	let fallback = null;
+	const tryN = Math.min(Math.max(maxTry, 8), ordered.length);
 	for (let i = 0; i < tryN; i++) {
 		const item = ordered[i];
 		const proxy = item.proxy || normalizeProxyUrl(item.host + ":" + item.port, item.protocol);
 		if (!proxy) continue;
-		if (!fallback) {
-			fallback = item;
-			fallback._proxy = proxy;
-		}
 		const start = Date.now();
 		let ok = false;
 		try {
-			ok = await isProxyLive(proxy, 800);
+			ok = await isProxyLive(proxy, 2800);
 		} catch (e) {
 			ok = false;
 		}
-		if (!ok) {
-			try {
-				ok = await testProxyTcpOpen(item.host, item.port, 1800);
-			} catch (e) {
-				ok = false;
-			}
-		}
+		// Never accept TCP-only / untested — must tunnel real HTTP
 		if (!ok) continue;
 		const ping = Date.now() - start;
 		let country = (item.country || "").toUpperCase();
@@ -2650,23 +2639,7 @@ async function pickRandomExitProxy(maxTry = 2) {
 			countryName: country || "",
 			source: item.source || "proxifly",
 			ping,
-		};
-	}
-	if (fallback) {
-		let country = (fallback.country || "").toUpperCase();
-		if (!country) {
-			try { country = await lookupExitCountry(fallback.host); } catch (e) { country = ""; }
-		}
-		return {
-			proxy: fallback._proxy,
-			host: fallback.host,
-			port: fallback.port,
-			protocol: fallback.protocol,
-			country: country || "",
-			countryName: country || "",
-			source: fallback.source || "proxifly",
-			ping: 0,
-			untested: true,
+			verified: true,
 		};
 	}
 	return null;
@@ -2680,12 +2653,12 @@ function normalizeProxyUrl(proxy, protocolHint) {
 	if (proto.includes("socks4")) return "socks4://" + p;
 	return "socks5://" + p;
 }
-async function isProxyLive(proxyUrl, timeoutMs = 900) {
+async function isProxyLive(proxyUrl, timeoutMs = 2800) {
 	if (!proxyUrl) return false;
 	let sock = null;
 	const timeoutId = setTimeout(() => {
 		try { sock && sock.close(); } catch (e) {}
-	}, timeoutMs);
+	}, timeoutMs + 200);
 	try {
 		const payload = UTF8.encode("GET /cdn-cgi/trace HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n");
 		sock = await connectProxy(proxyUrl, "cloudflare.com", 80, payload);
@@ -2693,7 +2666,7 @@ async function isProxyLive(proxyUrl, timeoutMs = 900) {
 		let buf = new Uint8Array(0);
 		const deadline = Date.now() + timeoutMs;
 		while (Date.now() < deadline) {
-			const remaining = Math.max(50, deadline - Date.now());
+			const remaining = Math.max(80, deadline - Date.now());
 			const res = await Promise.race([
 				reader.read(),
 				new Promise(function (resolve) {
@@ -2707,15 +2680,19 @@ async function isProxyLive(proxyUrl, timeoutMs = 900) {
 				merged.set(buf, 0);
 				merged.set(res.value, buf.length);
 				buf = merged;
-				if (buf.length >= 12) break;
+				const textEarly = FROM_UTF8.decode(buf.slice(0, Math.min(buf.length, 400)));
+				// Must see real HTTP or Cloudflare trace — not just open TCP
+				if (/HTTP\/\d/i.test(textEarly) || /(?:^|\n)(ip|fl|colo|loc)=/im.test(textEarly)) break;
+				if (buf.length >= 512) break;
 			}
 		}
 		clearTimeout(timeoutId);
 		try { reader.releaseLock(); } catch (eR) {}
 		try { sock.close(); } catch (e) {}
 		if (!buf.length) return false;
-		const text = FROM_UTF8.decode(buf.slice(0, Math.min(buf.length, 220)));
-		if (/HTTP\/\d/i.test(text) || /fl=|ip=|colo=/i.test(text) || buf.length >= 16) return true;
+		const text = FROM_UTF8.decode(buf.slice(0, Math.min(buf.length, 500)));
+		if (/HTTP\/\d\.\d\s*[123]/i.test(text)) return true;
+		if (/(?:^|\n)(ip|fl|colo|loc)=/im.test(text)) return true;
 		return false;
 	} catch (e) {
 		clearTimeout(timeoutId);
@@ -2758,7 +2735,7 @@ async function pickProxiflyProxy(countryCode, maxTest = 2) {
 		let proxy = item.proxy || (item.ip + ":" + item.port);
 		proxy = normalizeProxyUrl(proxy, item.protocol);
 		if (!proxy) continue;
-		const ok = await isProxyLive(proxy, 900);
+		const ok = await isProxyLive(proxy, 2800);
 		if (ok) return proxy;
 	}
 	return "";
