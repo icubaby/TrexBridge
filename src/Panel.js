@@ -1,4 +1,4 @@
-  import { connect } from "cloudflare:sockets";
+import { connect } from "cloudflare:sockets";
 
 const state = {
   traffic: new Map(),
@@ -522,8 +522,14 @@ const WorkerApp = {
 			} catch (e) {}
 			if (schemaEnsured) {
 				try {
-					ctx.waitUntil(checkAutoResets(env, ctx).catch(() => {}));
-					ctx.waitUntil(checkAutoRotates(env, ctx).catch(() => {}));
+					const _bgNow = Date.now();
+					if (!state._lastBgRun) state._lastBgRun = 0;
+					// Throttle background D1/work so panel API polls do not stack jobs
+					if (_bgNow - state._lastBgRun > 120000) {
+						state._lastBgRun = _bgNow;
+						ctx.waitUntil(checkAutoResets(env, ctx).catch(() => {}));
+						ctx.waitUntil(checkAutoRotates(env, ctx).catch(() => {}));
+					}
 					ctx.waitUntil(periodicStateFlush(env, ctx).catch(() => {}));
 				} catch (e) {}
 			}
@@ -1726,7 +1732,7 @@ const Router = {
 								cfReqs.today = dbToday + state.reqTotal;
 								cfReqs.total = dbTotal + state.reqTotal;
 							}
-							const CACHE_MS = 45000;
+							const CACHE_MS = 300000;
 							const needsRefresh = !state.cfReq.fetchedAt || Date.now() - state.cfReq.fetchedAt >= CACHE_MS;
 							if (needsRefresh && ctx) {
 								ctx.waitUntil(fetchCfAccountRequestsToday(env).catch(() => {}));
@@ -4385,7 +4391,7 @@ async function fetchCfAccountRequestsToday(env) {
 		}
 		state.cfReq.day = dayKey;
 
-		const CACHE_MS = 45000;
+		const CACHE_MS = 300000;
 		const freshEnough = state.cfReq.fetchedAt && Date.now() - state.cfReq.fetchedAt < CACHE_MS;
 
 		if (!freshEnough) {
@@ -7158,7 +7164,7 @@ function TrexBridgePanel() {
     loadUsers(false);
     timer.current = setInterval(() => {
       if (!document.hidden) loadUsers(true);
-    }, 45000);
+    }, 90000);
     return () => clearInterval(timer.current);
   }, [loadUsers]);
   const reqPct = Math.min(100, stats.requestsLimit > 0 ? stats.requestsToday / stats.requestsLimit * 100 : 0);
@@ -7177,7 +7183,7 @@ function TrexBridgePanel() {
   }, "Trex"), /*#__PURE__*/React.createElement("span", null, "Bridge")), /*#__PURE__*/React.createElement("span", {
     className: "brand-box bg-[#facc15] border-[2.5px] border-black px-2.5 py-1 text-[15px] font-black shadow-[2px_2px_0_#000]",
     style: { fontFamily: "Archivo, sans-serif", letterSpacing: "-0.3px" }
-  }, "v.3")), activeTab === "home" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, "v.4")), activeTab === "home" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     className: "grid grid-cols-2 md:grid-cols-4 gap-3 p-4"
   }, [{
     label: "Users",
